@@ -432,6 +432,67 @@ function iniciarRTMP() {
 }
 
 
+// ---------------------------------------------------------------
+// Monitor de CPU y RAM (en vivo, en el registro). Lee el uso REAL del contenedor (cgroup), no el de la máquina completa.
+// ---------------------------------------------------------------
+function leerNumero(ruta) {
+    try { return fs.readFileSync(ruta, 'utf8').trim(); } catch (e) { return null; }
+}
+
+// Segundos de CPU consumidos por el contenedor desde que arrancó
+function cpuUsadaSegundos() {
+    const v2 = leerNumero('/sys/fs/cgroup/cpu.stat');
+    if (v2) {
+        const m = v2.match(/usage_usec\s+(\d+)/);
+        if (m) return Number(m[1]) / 1e6;
+    }
+    const v1 = leerNumero('/sys/fs/cgroup/cpuacct/cpuacct.usage');
+    if (v1 && !isNaN(Number(v1))) return Number(v1) / 1e9;
+    return null;
+}
+
+// Núcleos que puede usar el contenedor (su límite), o los de la máquina si no hay límite
+function nucleosDisponibles() {
+    const v2 = leerNumero('/sys/fs/cgroup/cpu.max');
+    if (v2) {
+        const [cuota, periodo] = v2.split(/\s+/);
+        if (cuota && cuota !== 'max' && Number(periodo) > 0) return Number(cuota) / Number(periodo);
+    }
+    const q = leerNumero('/sys/fs/cgroup/cpu/cpu.cfs_quota_us'), pe = leerNumero('/sys/fs/cgroup/cpu/cpu.cfs_period_us');
+    if (q && pe && Number(q) > 0 && Number(pe) > 0) return Number(q) / Number(pe);
+    return os.cpus().length;
+}
+
+function memoriaContenedorMB() {
+    const uso = leerNumero('/sys/fs/cgroup/memory.current') || leerNumero('/sys/fs/cgroup/memory/memory.usage_in_bytes');
+    let lim = leerNumero('/sys/fs/cgroup/memory.max') || leerNumero('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+    const usoMB = uso && !isNaN(Number(uso)) ? Number(uso) / 1048576 : (os.totalmem() - os.freemem()) / 1048576;
+    let limMB = lim && !isNaN(Number(lim)) ? Number(lim) / 1048576 : null;
+    if (limMB && limMB > os.totalmem() / 1048576 * 1.5) limMB = null; // "sin límite" aparece como un número enorme
+    return { usoMB, limMB };
+}
+
+const SEGUNDOS_LOG_CPU = Math.max(5, Number(process.env.CPU_LOG_SEGUNDOS) || 30);
+let cpuAnterior = { t: Date.now(), seg: cpuUsadaSegundos() };
+setInterval(() => {
+    const ahora = Date.now();
+    const seg = cpuUsadaSegundos();
+    const nuc = nucleosDisponibles();
+    let txtCpu = 'CPU: no disponible';
+    if (seg !== null && cpuAnterior.seg !== null) {
+        const nucleosUsados = (seg - cpuAnterior.seg) / ((ahora - cpuAnterior.t) / 1000);
+        const pct = Math.round((nucleosUsados / nuc) * 100);
+        txtCpu = `CPU: ${pct}% (${nucleosUsados.toFixed(2)} de ${Math.round(nuc * 100) / 100} núcleos)`;
+    } else {
+        txtCpu = `CPU (carga 1 min): ${os.loadavg()[0].toFixed(2)} de ${os.cpus().length} núcleos`;
+    }
+    cpuAnterior = { t: ahora, seg };
+    const { usoMB, limMB } = memoriaContenedorMB();
+    const txtRam = `RAM: ${Math.round(usoMB)} MB${limMB ? ' de ' + Math.round(limMB) + ' MB' : ''}`;
+    const txtVel = salud.speed ? ` | velocidad de codificación: ${salud.speed}x` : '';
+    console.log(`🖥️ [CPU] ${txtCpu} | ${txtRam}${txtVel}`);
+}, SEGUNDOS_LOG_CPU * 1000);
+
 function corregirUrl(url) {
     if (!url) return FALLBACK_IMAGE;
     if (url.includes("dropbox.com")) {
@@ -966,6 +1027,7 @@ async function motorCanalC() {
             const maxrateV = salida720 ? '1500k' : '1800k';
             const bufsizeV = salida720 ? '2400k' : '3000k';
             console.log(`\n📺 AIRE: ${video.desc}`);
+            console.log(`🖼️ [LOGO] ${video.logo ? (fs.existsSync('Canal_C.png') ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
 
             let ffmpegArgs = [
                 '-reconnect', '1',
@@ -1309,4 +1371,3 @@ app.listen(port, () => {
     console.log(`🚀 Servidor de Canal C corriendo en el puerto ${port}`);
     motorCanalC();
 });
- 
