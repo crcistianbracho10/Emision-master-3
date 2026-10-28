@@ -876,7 +876,7 @@ function forzarRecalculo() {
 
 async function motorCanalC() {
     if (!fs.existsSync('Canal_C.png')) {
-        console.log("❌ [LOG CRÍTICO] Falta el archivo 'Canal_C.png' en la raíz del proyecto.");
+        console.log("❌ [LOG CRÍTICO] Falta el archivo 'Canal_C.png' en la raíz del proyecto (en esta imagen). El canal saldrá SIN logo hasta que se despliegue con el archivo incluido.");
     }
     if (RTMP_URL) iniciarRTMP();
     else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
@@ -978,7 +978,10 @@ async function motorCanalC() {
                 ...(HILOS ? ['-threads', HILOS] : []),
                 '-re',
                 '-i', urlFinal,
-                '-i', 'Canal_C.png'
+                // Si el logo no está en el servidor, se usa un cuadro transparente para que el canal salga igual (sin logo)
+                ...(fs.existsSync('Canal_C.png')
+                    ? ['-i', 'Canal_C.png']
+                    : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
             ];
 
             let filterComplex = video.logo ? 
@@ -1306,3 +1309,4 @@ app.listen(port, () => {
     console.log(`🚀 Servidor de Canal C corriendo en el puerto ${port}`);
     motorCanalC();
 });
+ 
