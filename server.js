@@ -384,7 +384,9 @@ function iniciarRTMP() {
     if (procesoRtmp) {
         try { procesoRtmp.removeAllListeners('close'); procesoRtmp.kill('SIGKILL'); } catch (e) {}
     }
-    console.log('📡 [RTMP] Conectando salida RTMP...');
+    let hostRtmp = '';
+    try { hostRtmp = new URL(RTMP_URL).host; } catch (e) { hostRtmp = '(RTMP_URL no es una URL válida)'; }
+    console.log(`📡 [RTMP] Conectando salida RTMP a ${hostRtmp} ...`);
     const proc = spawn('ffmpeg', [
         '-fflags', '+nobuffer+genpts',
         '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
@@ -396,19 +398,34 @@ function iniciarRTMP() {
     ]);
     procesoRtmp = proc;
     let conectado = false;
+    let lineasMostradas = 0;
+    let ultimoEstado = 0;
+    const avisoSinSenal = setTimeout(() => {
+        if (!conectado) console.log('⏳ [RTMP] Pasaron 40s y no llegan datos de video al RTMP: o el codificador aún no arranca (revisa los logs de arriba) o el servidor RTMP no respondió.');
+    }, 40000);
     proc.stderr.on('data', (data) => {
         const msg = data.toString().trim();
         if (!msg) return;
-        if (!conectado && msg.includes('frame=')) {
-            conectado = true;
-            console.log('✅ [RTMP] Transmitiendo al servidor RTMP.');
+        if (msg.includes('frame=')) {
+            if (!conectado) {
+                conectado = true;
+                console.log('✅ [RTMP] Transmitiendo al servidor RTMP.');
+            }
+            if (Date.now() - ultimoEstado > 60000) {
+                ultimoEstado = Date.now();
+                console.log(`📊 [RTMP] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)}`);
+            }
+            return;
         }
         if (/decode_slice_header|non-existing PPS|Last message repeated|co located POCs|mmco|reference picture missing|Packet corrupt|no frame/i.test(msg)) return;
-        if (/error|failed|refused|timed out|denied|unauthorized|Input\/output/i.test(msg) && !msg.includes('frame=')) {
-            console.log(`[RTMP ERROR]: ${ocultarClaveRtmp(msg).slice(0, 300)}`);
+        // Muestra lo primero que dice ffmpeg (entrada, salida, errores) para poder diagnosticar; la clave se oculta.
+        if (lineasMostradas < 40 || /error|failed|refused|timed out|denied|unauthorized|Input\/output|invalid|not found|Connection/i.test(msg)) {
+            lineasMostradas++;
+            console.log(`[RTMP] ${ocultarClaveRtmp(msg).slice(0, 300)}`);
         }
     });
     proc.on('close', (code, signal) => {
+        clearTimeout(avisoSinSenal);
         console.log(`⚠️ [RTMP] La salida RTMP se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
         reintentoRtmp = setTimeout(iniciarRTMP, 5000);
     });
@@ -1068,8 +1085,14 @@ async function motorCanalC() {
                     }
                 }, 5000);
 
+                const ultimasLineasFfmpeg = []; // últimas líneas de ffmpeg (sin progreso), para mostrar si falla
                 ffmpegProc.stderr.on('data', (data) => {
                     const msg = data.toString().trim();
+                    if (!msg.includes("frame=")) {
+                        for (const ln of msg.split('\n')) {
+                            if (ln.trim()) { ultimasLineasFfmpeg.push(ln.trim().slice(0, 220)); if (ultimasLineasFfmpeg.length > 8) ultimasLineasFfmpeg.shift(); }
+                        }
+                    }
                     if (msg.includes("frame=")) {
                         ultimoFrame = Date.now();
                         // Salud de la señal: velocidad de codificación (menos de 1x = el servidor no da abasto)
@@ -1120,6 +1143,9 @@ async function motorCanalC() {
 
                 ffmpegProc.on('close', (code) => {
                     console.log(`ℹ️ [CIERRE] Finalizó el archivo: ${video.desc} (Código: ${code})`);
+                    if (code !== 0 && code !== null) {
+                        console.log(`❌ [FFMPEG] Error al emitir "${video.desc}". Últimas líneas de ffmpeg:\n   ` + ultimasLineasFfmpeg.join('\n   '));
+                    }
                     clearInterval(verificadorHoraFin);
                     clearInterval(watchdogCongelamiento);
                     if (procesoActual === ffmpegProc) procesoActual = null;
