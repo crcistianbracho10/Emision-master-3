@@ -4,6 +4,7 @@ const axios = require('axios');
 const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
+const path = require('path');
 
 // Registro en memoria (se muestra en el panel)
 const logBuffer = [];
@@ -398,6 +399,7 @@ function iniciarRTMP() {
     ]);
     procesoRtmp = proc;
     let conectado = false;
+    let yaPublicando = false;
     let lineasMostradas = 0;
     let ultimoEstado = 0;
     const avisoSinSenal = setTimeout(() => {
@@ -406,6 +408,7 @@ function iniciarRTMP() {
     proc.stderr.on('data', (data) => {
         const msg = data.toString().trim();
         if (!msg) return;
+        if (/Already publishing/i.test(msg)) yaPublicando = true;
         if (msg.includes('frame=')) {
             if (!conectado) {
                 conectado = true;
@@ -426,11 +429,100 @@ function iniciarRTMP() {
     });
     proc.on('close', (code, signal) => {
         clearTimeout(avisoSinSenal);
-        console.log(`⚠️ [RTMP] La salida RTMP se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
-        reintentoRtmp = setTimeout(iniciarRTMP, 5000);
+        if (yaPublicando) {
+            console.log('⛔ [RTMP] Opencaster dice "Already publishing": ya hay OTRA transmisión usando esta misma clave (otra copia de esta app, un despliegue anterior que sigue encendido, u otro programa/OBS). Apaga la otra o espera a que su sesión expire. Reintento en 20s.');
+            reintentoRtmp = setTimeout(iniciarRTMP, 20000);
+        } else {
+            console.log(`⚠️ [RTMP] La salida RTMP se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
+            reintentoRtmp = setTimeout(iniciarRTMP, 5000);
+        }
     });
 }
 
+
+// ---------------------------------------------------------------
+// Logo del canal: se busca en varias carpetas (sin importar mayúsculas) y, si no está, se puede bajar de LOGO_URL
+// ---------------------------------------------------------------
+const LOGO_URL = (process.env.LOGO_URL || '').trim();   // cualquier enlace a una imagen (GitHub, Drive, Dropbox, Imgur, etc.)
+let LOGO_PATH = null;
+
+function buscarLogoLocal() {
+    const carpetas = [...new Set([process.cwd(), __dirname, '/app', '/tmp'])];
+    for (const dir of carpetas) {
+        try {
+            const nombre = fs.readdirSync(dir).find(f => f.toLowerCase() === 'canal_c.png');
+            if (nombre) return path.join(dir, nombre);
+        } catch (e) {}
+    }
+    return null;
+}
+
+// Convierte enlaces "de página" (GitHub, Google Drive, Dropbox, Imgur...) en enlaces directos a la imagen
+function enlaceDirectoLogo(u) {
+    u = String(u || '').trim();
+    if (!u) return '';
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) u = 'https://' + u.replace(/^\/+/, '');
+    let m;
+    // GitHub: .../blob/rama/archivo.png  ->  raw.githubusercontent.com/...
+    if ((m = u.match(/^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+?)(?:\?.*)?$/i))) {
+        return `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}`;
+    }
+    // Google Drive: /file/d/ID/view  o  open?id=ID
+    if ((m = u.match(/drive\.google\.com\/file\/d\/([^/?#]+)/i)) || (m = u.match(/drive\.google\.com\/(?:open|uc)\?(?:[^#]*&)?id=([^&#]+)/i))) {
+        return `https://drive.google.com/uc?export=download&id=${m[1]}`;
+    }
+    // Dropbox: fuerza la descarga directa
+    if (/dropbox\.com/i.test(u)) {
+        return u.replace(/www\.dropbox\.com/i, 'dl.dropboxusercontent.com').replace(/[?&]dl=[01]/i, '');
+    }
+    // Imgur: página de la imagen -> imagen directa
+    if ((m = u.match(/^https?:\/\/(?:www\.)?imgur\.com\/(?!a\/|gallery\/)([A-Za-z0-9]+)\/?$/i))) {
+        return `https://i.imgur.com/${m[1]}.png`;
+    }
+    return corregirUrl(u); // enlaces de tu dataset privado de Hugging Face (pasan por el servidor con el token)
+}
+
+// Detecta el tipo de imagen por sus primeros bytes (no por la extensión del enlace)
+function tipoImagen(buf) {
+    if (buf.length > 12) {
+        if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'png';
+        if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'jpg';
+        if (buf.slice(0, 4).toString() === 'GIF8') return 'gif';
+        if (buf.slice(0, 4).toString() === 'RIFF' && buf.slice(8, 12).toString() === 'WEBP') return 'webp';
+    }
+    return null;
+}
+
+async function prepararLogo() {
+    LOGO_PATH = null;
+    // 1) Si hay LOGO_URL, manda ese enlace (así puedes cambiar el logo solo cambiando el enlace)
+    if (LOGO_URL) {
+        const directo = enlaceDirectoLogo(LOGO_URL);
+        try {
+            const r = await axios.get(directo, {
+                responseType: 'arraybuffer', timeout: 25000, maxContentLength: 15 * 1024 * 1024,
+                headers: { 'User-Agent': UA_NAVEGADOR }, maxRedirects: 5
+            });
+            const buf = Buffer.from(r.data);
+            const tipo = tipoImagen(buf);
+            if (!tipo) throw new Error('el enlace no devuelve una imagen (png, jpg, gif o webp). Usa un enlace directo a la imagen, no a una página.');
+            LOGO_PATH = `/tmp/logo_descargado.${tipo}`;
+            fs.writeFileSync(LOGO_PATH, buf);
+            console.log(`🖼️ [LOGO] Logo descargado desde LOGO_URL (${tipo}, ${buf.length} bytes).`);
+        } catch (e) {
+            console.log(`❌ [LOGO] No se pudo usar LOGO_URL: ${e.response ? 'HTTP ' + e.response.status : e.message}`);
+        }
+    }
+    // 2) Si no hay enlace (o falló), se busca Canal_C.png en el servidor
+    if (!LOGO_PATH) LOGO_PATH = buscarLogoLocal();
+    if (LOGO_PATH) {
+        console.log(`🖼️ [LOGO] Logo en uso: ${LOGO_PATH} (${fs.statSync(LOGO_PATH).size} bytes)`);
+    } else {
+        let lista = '';
+        try { lista = fs.readdirSync(__dirname).slice(0, 40).join(', '); } catch (e) {}
+        console.log(`❌ [LOGO] No hay logo: el canal sale sin logo. Carpeta de trabajo: ${process.cwd()} | Carpeta del código: ${__dirname}\n   Archivos en la carpeta del código: ${lista}\n   Solución: define LOGO_URL con el enlace a tu logo.`);
+    }
+}
 
 // ---------------------------------------------------------------
 // Monitor de CPU y RAM (en vivo, en el registro). Lee el uso REAL del contenedor (cgroup), no el de la máquina completa.
@@ -936,9 +1028,7 @@ function forzarRecalculo() {
 }
 
 async function motorCanalC() {
-    if (!fs.existsSync('Canal_C.png')) {
-        console.log("❌ [LOG CRÍTICO] Falta el archivo 'Canal_C.png' en la raíz del proyecto (en esta imagen). El canal saldrá SIN logo hasta que se despliegue con el archivo incluido.");
-    }
+    await prepararLogo();
     if (RTMP_URL) iniciarRTMP();
     else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
     await sincronizarDataset();
@@ -1027,7 +1117,7 @@ async function motorCanalC() {
             const maxrateV = salida720 ? '1500k' : '1800k';
             const bufsizeV = salida720 ? '2400k' : '3000k';
             console.log(`\n📺 AIRE: ${video.desc}`);
-            console.log(`🖼️ [LOGO] ${video.logo ? (fs.existsSync('Canal_C.png') ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
+            console.log(`🖼️ [LOGO] ${video.logo ? (LOGO_PATH ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
 
             let ffmpegArgs = [
                 '-reconnect', '1',
@@ -1041,13 +1131,13 @@ async function motorCanalC() {
                 '-re',
                 '-i', urlFinal,
                 // Si el logo no está en el servidor, se usa un cuadro transparente para que el canal salga igual (sin logo)
-                ...(fs.existsSync('Canal_C.png')
-                    ? ['-i', 'Canal_C.png']
+                ...(LOGO_PATH
+                    ? ['-i', LOGO_PATH]
                     : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
             ];
 
             let filterComplex = video.logo ? 
-                `[0:v]fps=24,scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=250:250[logo];[bg][logo]overlay=${xPos}:90[v1];` : 
+                `[0:v]fps=24,scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=250:250:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:90[v1];` : 
                 `[0:v]fps=24,scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`;
 
             let etiqueta = 'v1';
@@ -1371,3 +1461,4 @@ app.listen(port, () => {
     console.log(`🚀 Servidor de Canal C corriendo en el puerto ${port}`);
     motorCanalC();
 });
+ 
