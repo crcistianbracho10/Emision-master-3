@@ -47,7 +47,7 @@ const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0);
 const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96); // kbps
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
 // Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
-const SEGUNDOS_CUADRO_CLAVE = 1;
+const SEGUNDOS_CUADRO_CLAVE = 1.5;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const DIR_OVERRIDES = '/tmp/overrides';
 const FONT_FILE = [
@@ -1128,8 +1128,8 @@ async function motorCanalC() {
             const sel = PERFIL;
             const kbpsV = BITRATE_VIDEO || sel.kbps;
             const bitrateV = `${kbpsV}k`;
-            const maxrateV = `${Math.round(kbpsV * 1.25)}k`;
-            const bufsizeV = `${Math.round(kbpsV * 1.5)}k`; // búfer corto: arranca más rápido y se queda más cerca del vivo
+            const maxrateV = `${Math.round(kbpsV * 1.5)}k`; // permite ráfagas: sale más rápido cuando hace falta
+            const bufsizeV = `${Math.round(kbpsV * 3)}k`; // búfer más grande: evita que el reproductor se quede cargando
             const presetX264 = sel.preset;
             console.log(`\n📺 AIRE: ${video.desc}`);
             console.log(`⚙️ [CALIDAD] ${sel.nombre} fija | ${sel.w}x${sel.h} | video ${kbpsV}k + audio ${BITRATE_AUDIO}k | ${FPS_SALIDA} fps | cuadro clave cada ${SEGUNDOS_CUADRO_CLAVE}s | x264 ${presetX264} | hilos ${HILOS}`);
