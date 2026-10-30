@@ -40,21 +40,14 @@ const ARCHIVO_CINTILLO = '/tmp/cintillo.txt';
 const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleosDisponibles())));
 
 // ---------------------------------------------------------------
-// Calidad de salida. CALIDAD (variable de entorno) o "salida" en ajustes.txt: auto | 360p | 480p | 576p | 720p | 1080p
+// Calidad de salida: SIEMPRE 768p (1366x768). No hay selector ni modo automático.
 // ---------------------------------------------------------------
-const PERFILES_CALIDAD = {
-    '360p':  { w: 640,  h: 360,  kbps: 420,  preset: 'ultrafast' },
-    '480p':  { w: 854,  h: 480,  kbps: 650,  preset: 'ultrafast' },
-    '576p':  { w: 1024, h: 576,  kbps: 900,  preset: 'superfast' },
-    '720p':  { w: 1280, h: 720,  kbps: 1200, preset: 'superfast' },
-    '1080p': { w: 0,    h: 0,    kbps: 1500, preset: 'superfast' }   // sin reducir
-};
-const ESCALERA_AUTO = ['360p', '480p', '576p', '720p'];             // en "auto" el canal sube y baja por aquí solo
-let indiceAuto = 1;                                                 // arranca en 480p
-let bloqueoSubidaHasta = 0;                                         // tras bajar, no vuelve a subir en un buen rato
-const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil
+const PERFIL = { nombre: '768p', w: 1366, h: 768, kbps: 1000, preset: 'superfast' };
+const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil (1000)
 const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96); // kbps
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
+// Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
+const SEGUNDOS_CUADRO_CLAVE = 1;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const DIR_OVERRIDES = '/tmp/overrides';
 const FONT_FILE = [
@@ -83,7 +76,6 @@ const AJUSTES_DEFECTO = {
     cintilloVelocidad: 140,
     cintilloColor: "0a50c8",
     modoCodificacion: "ligero",
-    salida: "auto",
     ajusteHorario: true,
     toleranciaMinutos: 3
 };
@@ -409,10 +401,13 @@ function iniciarRTMP() {
     console.log(`📡 [RTMP] Conectando salida RTMP a ${hostRtmp} ...`);
     const proc = spawn('ffmpeg', [
         '-fflags', '+nobuffer+genpts',
+        '-probesize', '500000',
+        '-analyzeduration', '500000',
         '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
         '-c:v', 'copy',
         '-c:a', 'copy',
         '-bsf:a', 'aac_adtstoasc',
+        '-flush_packets', '1',
         '-f', 'flv',
         RTMP_URL
     ]);
@@ -603,29 +598,6 @@ setInterval(() => {
     const txtVel = salud.speed ? ` | velocidad de codificación: ${salud.speed}x` : '';
     console.log(`🖥️ [CPU] ${txtCpu} | ${txtRam}${txtVel}`);
 }, SEGUNDOS_LOG_CPU * 1000);
-
-function elegirPerfilCalidad() {
-    const pedido = String(process.env.CALIDAD || (datasetConfig.ajustes || AJUSTES_DEFECTO).salida || 'auto').trim().toLowerCase();
-    if (PERFILES_CALIDAD[pedido]) return { nombre: pedido, auto: false, ...PERFILES_CALIDAD[pedido] };
-    const nombre = ESCALERA_AUTO[indiceAuto];
-    return { nombre, auto: true, ...PERFILES_CALIDAD[nombre] };
-}
-
-// Calidad automática: baja si el servidor no da abasto (velocidad < 1x) y sube si le sobra CPU
-function adaptarCalidadAuto(muestras, segundos, fraccionCpu) {
-    if (segundos < 45 || muestras.length < 3) return;   // video muy corto: no hay datos fiables
-    const media = muestras.reduce((a, b) => a + b, 0) / muestras.length;
-    if (media < 0.95 && indiceAuto > 0) {
-        indiceAuto--;
-        bloqueoSubidaHasta = Date.now() + 30 * 60 * 1000;
-        console.log(`🔧 [AUTO] El video iba a ${media.toFixed(2)}x (menos de 1x). Bajo la calidad a ${ESCALERA_AUTO[indiceAuto]} desde el próximo video.`);
-    } else if (media >= 0.98 && fraccionCpu !== null && fraccionCpu < 0.55 && indiceAuto < ESCALERA_AUTO.length - 1 && Date.now() > bloqueoSubidaHasta) {
-        indiceAuto++;
-        console.log(`🔧 [AUTO] Al servidor le sobra CPU (usó ${Math.round(fraccionCpu * 100)}%). Subo la calidad a ${ESCALERA_AUTO[indiceAuto]} desde el próximo video.`);
-    } else {
-        console.log(`🔧 [AUTO] Calidad ${ESCALERA_AUTO[indiceAuto]} se mantiene (velocidad ${media.toFixed(2)}x${fraccionCpu !== null ? ', CPU ' + Math.round(fraccionCpu * 100) + '%' : ''}).`);
-    }
-}
 
 function corregirUrl(url) {
     if (!url) return FALLBACK_IMAGE;
@@ -1152,15 +1124,15 @@ async function motorCanalC() {
             // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
             const modoC = (datasetConfig.ajustes || AJUSTES_DEFECTO).modoCodificacion || 'equilibrado';
             const scaleFlags = modoC === 'calidad' ? 'lanczos' : (modoC === 'ligero' ? 'fast_bilinear' : 'bilinear');
-            // Calidad: la composición (logo, banner, barra) se hace en 1080p y al final se reduce al perfil elegido
-            const sel = elegirPerfilCalidad();
+            // La composición (logo, banner, barra) se hace en 1080p y al final se reduce SIEMPRE a 768p
+            const sel = PERFIL;
             const kbpsV = BITRATE_VIDEO || sel.kbps;
             const bitrateV = `${kbpsV}k`;
             const maxrateV = `${Math.round(kbpsV * 1.25)}k`;
-            const bufsizeV = `${Math.round(kbpsV * 2)}k`;
-            const presetX264 = (modoC === 'calidad' && (sel.w === 0 || sel.w >= 1280)) ? 'veryfast' : sel.preset;
+            const bufsizeV = `${Math.round(kbpsV * 1.5)}k`; // búfer corto: arranca más rápido y se queda más cerca del vivo
+            const presetX264 = sel.preset;
             console.log(`\n📺 AIRE: ${video.desc}`);
-            console.log(`⚙️ [CALIDAD] ${sel.nombre}${sel.auto ? ' (automática)' : ''} | ${sel.w ? sel.w + 'x' + sel.h : '1920x1080'} | video ${kbpsV}k + audio ${BITRATE_AUDIO}k | ${FPS_SALIDA} fps | x264 ${presetX264} | hilos ${HILOS}`);
+            console.log(`⚙️ [CALIDAD] ${sel.nombre} fija | ${sel.w}x${sel.h} | video ${kbpsV}k + audio ${BITRATE_AUDIO}k | ${FPS_SALIDA} fps | cuadro clave cada ${SEGUNDOS_CUADRO_CLAVE}s | x264 ${presetX264} | hilos ${HILOS}`);
             console.log(`🖼️ [LOGO] ${video.logo ? (LOGO_PATH ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
 
             let ffmpegArgs = [
@@ -1171,6 +1143,8 @@ async function motorCanalC() {
                 '-fflags', '+genpts+ignidx+discardcorrupt',
                 '-err_detect', 'ignore_err',
                 '-user_agent', UA_NAVEGADOR,
+                '-probesize', '2M',
+                '-analyzeduration', '2000000',
                 ...(HILOS ? ['-threads', HILOS, '-filter_complex_threads', HILOS] : []),
                 '-re',
                 '-i', urlFinal,
@@ -1233,14 +1207,16 @@ async function motorCanalC() {
                 etiqueta = 'vt';
             }
 
-            filterComplex += `[${etiqueta}]${sel.w ? `scale=${sel.w}:${sel.h}:flags=fast_bilinear,` : ''}format=yuv420p[v];[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
+            filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
 
             ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
             ffmpegArgs.push(
                 '-c:v', 'libx264', '-preset', presetX264, '-tune', 'zerolatency',
                 ...(HILOS ? ['-threads', HILOS] : []),
-                '-b:v', bitrateV, '-maxrate', maxrateV, '-bufsize', bufsizeV, '-g', String(FPS_SALIDA * 2),
+                '-b:v', bitrateV, '-maxrate', maxrateV, '-bufsize', bufsizeV,
+                '-g', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-keyint_min', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-sc_threshold', '0',
                 '-c:a', 'aac', '-b:a', `${BITRATE_AUDIO}k`, '-ac', '2',
+                '-muxdelay', '0', '-flush_packets', '1',
                 '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
             );
 
@@ -1250,8 +1226,6 @@ async function motorCanalC() {
                 let ultimoFrame = Date.now();
                 const inicioProcTs = Date.now();
                 let lentoDesde = 0, omitidoPorLento = false;
-                const muestrasVel = [];
-                const cpuIni = cpuUsadaSegundos(), tIni = Date.now();
                 const puedeOmitirPorLento = !video.alTerminar && (itemActual.tipo === 'programa_secuencia' || itemActual.tipo === 'gist');
                 let duracionActual = 0, tiempoActual = 0, cortePorHorario = false;
 
@@ -1303,12 +1277,11 @@ async function motorCanalC() {
                             const v = parseFloat(sp[sp.length - 1].replace(/[^\d.]/g, ''));
                             if (!isNaN(v)) {
                                 salud.speed = v; salud.t = Date.now();
-                                if (Date.now() - inicioProcTs > 15000) muestrasVel.push(v);
                                 if (v < 0.9 && Date.now() - inicioProcTs > 15000 && Date.now() - salud.ultimoAviso > 30000) {
                                     salud.ultimoAviso = Date.now();
                                     const carga = os.loadavg()[0].toFixed(1), nuc = os.cpus().length;
                                     console.log(`⚠️ [SEÑAL] "${video.desc}" va a ${v}x (menos de 1x = se congela). Carga del servidor: ${carga} de ${nuc} núcleos. ` +
-                                        (os.loadavg()[0] < nuc * 0.7 ? 'El servidor no está saturado: el problema es ese video o su hosting (revísalo en el panel).' : 'El servidor está saturado: baja la calidad (CALIDAD=480p o auto).'));
+                                        (os.loadavg()[0] < nuc * 0.7 ? 'El servidor no está saturado: el problema es ese video o su hosting (revísalo en el panel).' : 'El servidor está saturado: baja BITRATE_VIDEO (ej. 800) o FPS_SALIDA (ej. 20).'));
                                 }
                                 // Lentitud sostenida en un video que no es episodio: se corta y se salta por 1 hora
                                 if (v < 0.5 && Date.now() - inicioProcTs > 10000) {
@@ -1345,11 +1318,6 @@ async function motorCanalC() {
 
                 ffmpegProc.on('close', (code) => {
                     console.log(`ℹ️ [CIERRE] Finalizó el archivo: ${video.desc} (Código: ${code})`);
-                    if (sel.auto) {
-                        const cpuFin = cpuUsadaSegundos();
-                        const fraccion = (cpuIni !== null && cpuFin !== null && Date.now() > tIni) ? ((cpuFin - cpuIni) / ((Date.now() - tIni) / 1000)) / nucleosDisponibles() : null;
-                        adaptarCalidadAuto(muestrasVel, (Date.now() - tIni) / 1000, fraccion);
-                    }
                     if (code !== 0 && code !== null) {
                         console.log(`❌ [FFMPEG] Error al emitir "${video.desc}". Últimas líneas de ffmpeg:\n   ` + ultimasLineasFfmpeg.join('\n   '));
                     }
