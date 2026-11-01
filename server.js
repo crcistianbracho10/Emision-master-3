@@ -109,7 +109,7 @@ const CLAVES_PANEL = {
     publicidad:          { archivo: 'publicidad.txt', tipo: 'lista' },
     intros:              { archivo: 'intros.txt', tipo: 'lista' },
     clasificacion:       { archivo: 'clasificacion.txt', tipo: 'lista' },
-    inicioProg:          { archivo: 'inicioprog.txt', tipo: 'lista' },
+    inicioProg:          { archivo: 'next.txt', tipo: 'lista' }, // "A continuación": [{ "programa": "Nombre exacto", "video": "https://..." }]
     magazine:            { archivo: 'programas/magazine.txt', tipo: 'lista' },
     secretosProsperidad: { archivo: 'programas/secretos-de-prosperidad.txt', tipo: 'lista' },
     cartasTaron:         { archivo: 'programas/cartas-taron.txt', tipo: 'lista' }
@@ -714,7 +714,7 @@ function getTodaPublicidad() {
         .map(p => corregirUrl(p.video || p.url));
 }
 
-// Busca en inicioprog.txt el video "A continuación" del programa
+// Busca en next.txt el video "A continuación" del programa
 // Formato: [{ "programa": "Nombre exacto del programa", "video": "https://..." }]
 function getVideoInicioProg(nombrePrograma) {
     const lista = datasetConfig.inicioProg;
@@ -874,14 +874,14 @@ function obtenerElementoActualEnEmision() {
 
             let secuenciaBloque = [];
 
-            // 1) "A continuación: [programa]" (inicioprog.txt) — solo al comenzar el programa
+            // 1) "A continuación: [programa]" (next.txt) — solo al comenzar el programa
             const claveInicio = `${fechaHoyStr}-${claveProg}`;
             if (ultimoInicioProg !== claveInicio) {
                 const videoInicioProg = getVideoInicioProg(prog.nombre);
                 if (videoInicioProg) {
                     secuenciaBloque.push({ url: videoInicioProg, logo: false, desc: `A continuación: ${prog.nombre}` });
                 } else {
-                    console.log(`ℹ️ [A CONTINUACIÓN] "${prog.nombre}" no tiene video asignado (se agrega en el panel, pestaña "Agregar video").`);
+                    console.log(`ℹ️ [A CONTINUACIÓN] "${prog.nombre}" no tiene video asignado en next.txt (formato: [{ "programa": "${prog.nombre}", "video": "https://..." }]).`);
                 }
                 ultimoInicioProg = claveInicio;
             }
@@ -1118,7 +1118,8 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            let xPos = video.logoDer ? "main_w-overlay_w-200" : "200";
+            // Logo un poco más cerca de la esquina (170 en vez de 200)
+            let xPos = video.logoDer ? "main_w-overlay_w-170" : "170";
             const urlFinal = corregirUrl(video.url);
 
             // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
@@ -1154,8 +1155,9 @@ async function motorCanalC() {
                     : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
             ];
 
+            // Logo: tamaño 245 (antes 250) y posición Y 75 (antes 90)
             let filterComplex = video.logo ? 
-                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=250:250:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:90[v1];` : 
+                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=245:245:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:75[v1];` : 
                 `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`;
 
             let etiqueta = 'v1';
