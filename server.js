@@ -48,6 +48,13 @@ const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
 // Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
 const SEGUNDOS_CUADRO_CLAVE = 1.5;
+// Logo del canal (se cambian en las variables de entorno, sin tocar el código):
+// LOGO_TAMANO = tamaño en píxeles (sube o baja), LOGO_X = distancia al borde, LOGO_Y = distancia al borde de arriba.
+const LOGO_TAMANO = Math.max(40, parseInt(process.env.LOGO_TAMANO, 10) || 245);
+const LOGO_X = Math.max(0, parseInt(process.env.LOGO_X, 10) || 170);
+const LOGO_Y = Math.max(0, parseInt(process.env.LOGO_Y, 10) || 75);
+// Minutos que tiene el himno para arrancar desde su hora de inicio (si no se le pone "fin" en el himno)
+const HIMNO_VENTANA_MIN = 10;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const DIR_OVERRIDES = '/tmp/overrides';
 const FONT_FILE = [
@@ -84,9 +91,9 @@ let datasetConfig = {
     vivo: [],
     programacion: [],
     himno: [
-        { url: HIMNO_OFICIAL_URL, inicio: "06:00:00", fin: "06:04:30" }, 
-        { url: HIMNO_OFICIAL_URL, inicio: "00:00:00", fin: "00:04:30" }, 
-        { url: HIMNO_OFICIAL_URL, inicio: "18:00:00", fin: "18:04:30" }
+        { url: HIMNO_OFICIAL_URL, inicio: "06:00:00" },
+        { url: HIMNO_OFICIAL_URL, inicio: "00:00:00" },
+        { url: HIMNO_OFICIAL_URL, inicio: "18:00:00" }
     ],
     intros: [],
     publicidad: [],
@@ -273,6 +280,12 @@ function convertirSegundos(horaStr) {
     const m = partes[1] || 0;
     const s = partes[2] || 0;
     return h * 3600 + m * 60 + s;
+}
+
+function sumarSegundosHora(horaStr, seg) {
+    const t = (convertirSegundos(horaStr) + seg) % 86400;
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(Math.floor(t / 3600))}:${pad(Math.floor((t % 3600) / 60))}:${pad(t % 60)}`;
 }
 
 function estaEnHorario(inicio, fin, horaActualStr) {
@@ -775,7 +788,8 @@ function obtenerElementoActualEnEmision() {
     if (datasetConfig.himno && datasetConfig.himno.length > 0) {
         for (let hItem of datasetConfig.himno) {
             let idHimnoUnico = `${fechaHoyStr}-${hItem.inicio}`;
-            if (estaEnHorario(hItem.inicio, hItem.fin, horaCompletaStr)) {
+            const finVentana = hItem.fin || sumarSegundosHora(hItem.inicio, HIMNO_VENTANA_MIN * 60);
+            if (estaEnHorario(hItem.inicio, finVentana, horaCompletaStr)) {
                 if (ultimoHimnoReproducido !== idHimnoUnico) {
                     estadoActualTransmision.tituloActual = "Himno Nacional";
                     estadoActualTransmision.programaActual = "Transmisión Oficial";
@@ -783,8 +797,7 @@ function obtenerElementoActualEnEmision() {
                     return {
                         tipo: 'himno',
                         idUnico: idHimnoUnico,
-                        horaFinBloque: hItem.fin,
-                        corteEstricto: true,
+                        // Sin corte por horario: el himno siempre se reproduce completo
                         secuencia: [{ url: corregirUrl(hItem.url), logo: true, logoDer: false, desc: "Himno Nacional" }]
                     };
                 }
@@ -1118,8 +1131,8 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            // Logo un poco más cerca de la esquina (170 en vez de 200)
-            let xPos = video.logoDer ? "main_w-overlay_w-170" : "170";
+            // Posición horizontal del logo (LOGO_X)
+            let xPos = video.logoDer ? `main_w-overlay_w-${LOGO_X}` : String(LOGO_X);
             const urlFinal = corregirUrl(video.url);
 
             // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
@@ -1147,6 +1160,7 @@ async function motorCanalC() {
                 '-probesize', '2M',
                 '-analyzeduration', '2000000',
                 ...(HILOS ? ['-threads', HILOS, '-filter_complex_threads', HILOS] : []),
+                '-thread_queue_size', '512',
                 '-re',
                 '-i', urlFinal,
                 // Si el logo no está en el servidor, se usa un cuadro transparente para que el canal salga igual (sin logo)
@@ -1155,9 +1169,9 @@ async function motorCanalC() {
                     : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
             ];
 
-            // Logo: tamaño 245 (antes 250) y posición Y 75 (antes 90)
+            // Logo: tamaño y posición vienen de LOGO_TAMANO, LOGO_X y LOGO_Y
             let filterComplex = video.logo ? 
-                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=245:245:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:75[v1];` : 
+                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=${LOGO_TAMANO}:${LOGO_TAMANO}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${LOGO_Y}[v1];` : 
                 `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`;
 
             let etiqueta = 'v1';
@@ -1209,7 +1223,7 @@ async function motorCanalC() {
                 etiqueta = 'vt';
             }
 
-            filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
+            filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
 
             ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
             ffmpegArgs.push(
@@ -1218,6 +1232,7 @@ async function motorCanalC() {
                 '-b:v', bitrateV, '-maxrate', maxrateV, '-bufsize', bufsizeV,
                 '-g', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-keyint_min', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-sc_threshold', '0',
                 '-c:a', 'aac', '-b:a', `${BITRATE_AUDIO}k`, '-ac', '2',
+                '-max_muxing_queue_size', '1024',
                 '-muxdelay', '0', '-flush_packets', '1',
                 '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
             );
@@ -1312,7 +1327,7 @@ async function motorCanalC() {
                 });
 
                 const watchdogCongelamiento = setInterval(() => {
-                    if (Date.now() - ultimoFrame > 25000) {
+                    if (Date.now() - ultimoFrame > 15000) {
                         console.log(`⚠️ [WATCHDOG] El video "${video.desc}" se congeló. Forzando reinicio del proceso.`);
                         ffmpegProc.kill('SIGKILL');
                     }
