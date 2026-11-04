@@ -40,19 +40,24 @@ const ARCHIVO_CINTILLO = '/tmp/cintillo.txt';
 const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleosDisponibles())));
 
 // ---------------------------------------------------------------
-// Calidad de salida: SIEMPRE 768p (1366x768). No hay selector ni modo automático.
+// Calidad de salida: SIEMPRE 720p (1280x720). No hay selector ni modo automático.
+// Todo (logo, banner, barra, textos) se compone directamente a 720p: así ffmpeg no trabaja en 1080p
+// y gasta bastante menos CPU. Las medidas de abajo están pensadas "como si fuera 1080p" y se escalan solas.
 // ---------------------------------------------------------------
-const PERFIL = { nombre: '768p', w: 1366, h: 768, kbps: 1000, preset: 'superfast' };
+const PERFIL = { nombre: '720p', w: 1280, h: 720, kbps: 1000, preset: 'superfast' };
+const K = PERFIL.w / 1920;                                   // factor de escala respecto a 1080p
+const esc = (n) => Math.round(n * K);                        // medida escalada (posiciones, tamaños de letra)
+const escPar = (n) => Math.max(2, Math.round((n * K) / 2) * 2); // medida escalada y par (para scale de ffmpeg)
 const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil (1000)
 const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96); // kbps
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
 // Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
 const SEGUNDOS_CUADRO_CLAVE = 1.5;
-// Logo del canal (se cambian en las variables de entorno, sin tocar el código):
-// LOGO_TAMANO = tamaño en píxeles (sube o baja), LOGO_X = distancia al borde, LOGO_Y = distancia al borde de arriba.
+// Logo del canal: el TAMAÑO se cambia con la variable de entorno LOGO_TAMANO (sin tocar el código).
+// La posición (X e Y) es fija: ya no se cambia con variables.
 const LOGO_TAMANO = Math.max(40, parseInt(process.env.LOGO_TAMANO, 10) || 245);
-const LOGO_X = Math.max(0, parseInt(process.env.LOGO_X, 10) || 170);
-const LOGO_Y = Math.max(0, parseInt(process.env.LOGO_Y, 10) || 75);
+const LOGO_X = 170; // distancia al borde (fija)
+const LOGO_Y = 75;  // distancia al borde de arriba (fija)
 // Minutos que tiene el himno para arrancar desde su hora de inicio (si no se le pone "fin" en el himno)
 const HIMNO_VENTANA_MIN = 10;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -64,6 +69,12 @@ const FONT_FILE = [
 ].find(p => fs.existsSync(p)) || null;
 
 const HIMNO_OFICIAL_URL = "https://files.catbox.moe/zvee4n.mp4";
+
+// Video que se repite en bucle cuando una retransmisión (vivo.txt) está en su horario pero todavía no transmite
+const VIDEO_ESPERA_VIVO_URL = "https://videotourl.com/videos/1793100696516-8e8d422e-7e15-4f4f-838f-767c93c8b819.mp4";
+// Imagen que se muestra cuando pasan 30 minutos o más sin ninguna programación
+const IMAGEN_SIN_PROGRAMACION_URL = "https://i.postimg.cc/0y9DdgmR/file-000000009fc481f58b7c2f61fb5768b6.png";
+const MIN_HUECO_IMAGEN = 30;
 
 if (!fs.existsSync(DIR_OVERRIDES)) {
     fs.mkdirSync(DIR_OVERRIDES, { recursive: true });
@@ -226,6 +237,18 @@ async function actualizarImagenesEvento() {
         const ruta = clavePj ? await descargarImagen(clavePj, 'evento_personaje') : null;
         imagenesEvento.personaje = { url: clavePj, ruta };
     }
+}
+
+// Imágenes fijas que se muestran en pantalla (sin programación, señal de ajuste). Se bajan UNA vez al disco:
+// así ffmpeg no vuelve a descargarlas en cada cuadro y gasta casi nada de CPU.
+const imagenesFijas = new Map();
+async function rutaImagenFija(url, nombre) {
+    const guardada = imagenesFijas.get(nombre);
+    if (guardada && fs.existsSync(guardada)) return guardada;
+    const ruta = await descargarImagen(url, nombre);
+    if (ruta) imagenesFijas.set(nombre, ruta);
+    else console.log(`⚠️ [IMAGEN] No se pudo descargar la imagen "${nombre}" (${url}).`);
+    return ruta;
 }
 
 function escribirArchivoAtomico(ruta, texto) {
@@ -776,9 +799,84 @@ function bloqueVencido(item) {
     return !!(ev && ev.tipo === 'en_curso');
 }
 
+// ---------------------------------------------------------------
+// Retransmisiones: ¿ya está transmitiendo la señal? (se revisa con una petición pequeña, casi sin CPU)
+// ---------------------------------------------------------------
+const cacheVivo = new Map();
+async function vivoDisponible(url, maxEdadMs = 8000) {
+    const u = corregirUrl(url);
+    const c = cacheVivo.get(u);
+    if (c && Date.now() - c.t < maxEdadMs) return c.ok;
+    let ok = false;
+    try {
+        if (/\.m3u8(\?|$)/i.test(u)) {
+            // Lista HLS: debe existir y traer al menos un fragmento o una calidad
+            const r = await axios.get(u, { headers: { 'User-Agent': UA_NAVEGADOR }, responseType: 'text', timeout: 6000, validateStatus: () => true, maxRedirects: 5, maxContentLength: 2 * 1024 * 1024 });
+            const txt = typeof r.data === 'string' ? r.data : '';
+            ok = r.status === 200 && /#EXTM3U/.test(txt) && /#EXTINF|#EXT-X-STREAM-INF/.test(txt);
+        } else {
+            const r = await axios.get(u, { headers: { 'User-Agent': UA_NAVEGADOR, Range: 'bytes=0-2047' }, responseType: 'stream', timeout: 6000, validateStatus: () => true, maxRedirects: 5 });
+            ok = r.status === 200 || r.status === 206;
+            try { r.data.destroy(); } catch (e) {}
+        }
+    } catch (e) { ok = false; }
+    cacheVivo.set(u, { ok, t: Date.now() });
+    return ok;
+}
+
+// ---------------------------------------------------------------
+// Huecos sin programación
+// ---------------------------------------------------------------
+
+// Minutos que faltan para que empiece lo próximo programado (programa, retransmisión, himno o evento)
+function minutosHastaProximaProgramacion() {
+    const { horaCompletaStr, fechaVE } = obtenerTiempoVenezuela();
+    const ahora = convertirSegundos(horaCompletaStr);
+    const dia = diaSemanaVenezuela();
+    let mejor = Infinity; // segundos
+    const considerar = (dias, inicio) => {
+        if (!inicio) return;
+        const ini = convertirSegundos(inicio);
+        for (let d = 0; d <= 1; d++) { // hoy y mañana
+            if (!(dias || []).includes((dia + d) % 7)) continue;
+            const falta = ini + d * 86400 - ahora;
+            if (falta > 0 && falta < mejor) mejor = falta;
+        }
+    };
+    (datasetConfig.programacion || []).forEach(p => considerar(p.dias, p.inicio));
+    (datasetConfig.vivo || []).forEach(v => considerar(v.dias, v.inicio));
+    (datasetConfig.himno || []).forEach(h => considerar([0, 1, 2, 3, 4, 5, 6], h.inicio));
+    (datasetConfig.evento || []).forEach(ev => {
+        if (!ev || !ev.fechaInicio || !ev.horaInicio) return;
+        if (ev.repetir) { considerar([0, 1, 2, 3, 4, 5, 6], ev.horaInicio); return; }
+        const ini = new Date(`${ev.fechaInicio}T${String(ev.horaInicio).split(':').slice(0, 2).join(':')}:00`);
+        const falta = (ini - fechaVE) / 1000;
+        if (falta > 0 && falta < mejor) mejor = falta;
+    });
+    return mejor / 60;
+}
+
+// ¿Hay ahora algo programado que deba salir al aire? (sirve para quitar la imagen de "sin programación")
+function hayAlgoProgramadoAhora() {
+    if (colaManual.length > 0 || programaForzado !== null || eventoForzado) return true;
+    const ev = verificarEstadoEvento();
+    if (ev && ev.tipo === 'en_curso') return true;
+    const pa = programaProgramadoAhora();
+    if (pa && pa.clave !== slotCompletado) return true;
+    const { horaCompletaStr } = obtenerTiempoVenezuela();
+    const dia = diaSemanaVenezuela();
+    if ((datasetConfig.vivo || []).some(v => (v.dias || []).includes(dia) && estaEnHorario(v.inicio, v.fin, horaCompletaStr))) return true;
+    const fechaHoy = fechaVenezuelaStr();
+    if ((datasetConfig.himno || []).some(h => {
+        const fin = h.fin || sumarSegundosHora(h.inicio, HIMNO_VENTANA_MIN * 60);
+        return estaEnHorario(h.inicio, fin, horaCompletaStr) && ultimoHimnoReproducido !== `${fechaHoy}-${h.inicio}`;
+    })) return true;
+    return false;
+}
+
 let indiceGistActual = 0;
 
-function obtenerElementoActualEnEmision() {
+async function obtenerElementoActualEnEmision() {
     const { horaStr, horaCompletaStr } = obtenerTiempoVenezuela();
     estadoActualTransmision.horaVenezuela = horaCompletaStr;
     const diaSemana = diaSemanaVenezuela();
@@ -809,6 +907,21 @@ function obtenerElementoActualEnEmision() {
     if (programaForzado === null && datasetConfig.vivo && datasetConfig.vivo.length > 0) {
         for (let vivoItem of datasetConfig.vivo) {
             if (vivoItem.dias.includes(diaSemana) && estaEnHorario(vivoItem.inicio, vivoItem.fin, horaCompletaStr)) {
+                // Si la retransmisión todavía no transmite: se repite en bucle el video de espera
+                // hasta que llegue la señal (se revisa cada pocos segundos) o hasta que termine su horario.
+                const disponible = await vivoDisponible(vivoItem.url);
+                if (!disponible) {
+                    estadoActualTransmision.tituloActual = `Esperando señal: ${vivoItem.nombre}`;
+                    estadoActualTransmision.programaActual = vivoItem.nombre;
+                    estadoActualTransmision.aContinuacion = "Programación Regular";
+                    return {
+                        tipo: 'vivo_espera',
+                        horaFinBloque: vivoItem.fin,
+                        corteEstricto: true,
+                        urlVivo: vivoItem.url,
+                        secuencia: [{ url: corregirUrl(VIDEO_ESPERA_VIVO_URL), bucle: true, logo: true, logoDer: false, permiteBanner: true, desc: `Esperando señal: ${vivoItem.nombre}` }]
+                    };
+                }
                 estadoActualTransmision.tituloActual = `Retransmisión: ${vivoItem.nombre}`;
                 estadoActualTransmision.programaActual = vivoItem.nombre;
                 estadoActualTransmision.aContinuacion = "Programación Regular";
@@ -953,6 +1066,22 @@ function obtenerElementoActualEnEmision() {
         }
     }
 
+    // Sin programación: si faltan 30 minutos o más para lo próximo (o no hay nada programado), se muestra la imagen fija.
+    // Si el hueco es corto, sigue la rotación del Gist como antes.
+    if (!slotCompletado && minutosHastaProximaProgramacion() >= MIN_HUECO_IMAGEN) {
+        const ruta = await rutaImagenFija(IMAGEN_SIN_PROGRAMACION_URL, 'sin_programacion');
+        if (ruta) {
+            estadoActualTransmision.tituloActual = "Sin programación";
+            estadoActualTransmision.programaActual = "Canal C";
+            estadoActualTransmision.aContinuacion = "Programación Regular";
+            return {
+                tipo: 'sin_programacion',
+                esperaImagen: true,
+                secuencia: [{ url: ruta, esImagen: true, logo: false, logoDer: false, desc: "Imagen: sin programación" }]
+            };
+        }
+    }
+
     if (datasetConfig.playlistGist.length > 0) {
         if (indiceGistActual >= datasetConfig.playlistGist.length) indiceGistActual = 0;
         let itemGist = datasetConfig.playlistGist[indiceGistActual];
@@ -970,9 +1099,11 @@ function obtenerElementoActualEnEmision() {
     estadoActualTransmision.tituloActual = "Señal de Ajuste";
     estadoActualTransmision.programaActual = "Mantenimiento";
     estadoActualTransmision.aContinuacion = "Ninguna";
+    const rutaFallback = await rutaImagenFija(FALLBACK_IMAGE, 'fallback');
     return {
         tipo: 'fallback',
-        secuencia: [{ url: FALLBACK_IMAGE, logo: true, logoDer: false, desc: "Imagen de Salvación" }]
+        esperaImagen: true,
+        secuencia: [{ url: rutaFallback || FALLBACK_IMAGE, esImagen: !!rutaFallback, logo: true, logoDer: false, desc: "Imagen de Salvación" }]
     };
 }
 
@@ -1059,6 +1190,8 @@ async function motorCanalC() {
     if (RTMP_URL) iniciarRTMP();
     else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
     await sincronizarDataset();
+    // Se deja lista la imagen de "sin programación" para que salga al instante cuando haga falta
+    rutaImagenFija(IMAGEN_SIN_PROGRAMACION_URL, 'sin_programacion');
     while (true) {
         interrumpirBloque = false;
 
@@ -1071,7 +1204,7 @@ async function motorCanalC() {
             estadoActualTransmision.aContinuacion = "Programación Regular";
             itemActual = { tipo: 'manual', secuencia: [m] };
         } else {
-            itemActual = obtenerElementoActualEnEmision();
+            itemActual = await obtenerElementoActualEnEmision();
         }
 
         // Si es himno, registramos que ya se reprodujo para este bloque exacto
@@ -1131,14 +1264,18 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            // Posición horizontal del logo (LOGO_X)
-            let xPos = video.logoDer ? `main_w-overlay_w-${LOGO_X}` : String(LOGO_X);
             const urlFinal = corregirUrl(video.url);
+            const esImagen = !!video.esImagen;       // imagen fija: se repite en bucle con audio en silencio
+            const esHttp = /^https?:/i.test(urlFinal);
+
+            // Posición horizontal del logo (fija, ya escalada a 720p)
+            const logoXpx = esc(LOGO_X), logoYpx = esc(LOGO_Y);
+            let xPos = video.logoDer ? `main_w-overlay_w-${logoXpx}` : String(logoXpx);
 
             // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
             const modoC = (datasetConfig.ajustes || AJUSTES_DEFECTO).modoCodificacion || 'equilibrado';
             const scaleFlags = modoC === 'calidad' ? 'lanczos' : (modoC === 'ligero' ? 'fast_bilinear' : 'bilinear');
-            // La composición (logo, banner, barra) se hace en 1080p y al final se reduce SIEMPRE a 768p
+            // Todo se compone directamente a 720p (sin pasar por 1080p): menos CPU
             const sel = PERFIL;
             const kbpsV = BITRATE_VIDEO || sel.kbps;
             const bitrateV = `${kbpsV}k`;
@@ -1150,29 +1287,37 @@ async function motorCanalC() {
             console.log(`🖼️ [LOGO] ${video.logo ? (LOGO_PATH ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
 
             let ffmpegArgs = [
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '5',
-                '-timeout', '20000000',
+                // Opciones de red: solo para enlaces http (en archivos locales ffmpeg las rechazaría)
+                ...(esHttp ? [
+                    '-reconnect', '1',
+                    '-reconnect_streamed', '1',
+                    '-reconnect_delay_max', '5',
+                    '-timeout', '20000000',
+                    '-user_agent', UA_NAVEGADOR
+                ] : []),
                 '-fflags', '+genpts+ignidx+discardcorrupt',
                 '-err_detect', 'ignore_err',
-                '-user_agent', UA_NAVEGADOR,
                 '-probesize', '2M',
                 '-analyzeduration', '2000000',
                 ...(HILOS ? ['-threads', HILOS, '-filter_complex_threads', HILOS] : []),
                 '-thread_queue_size', '512',
+                ...(video.bucle ? ['-stream_loop', '-1'] : []),
+                ...(esImagen ? ['-loop', '1', '-framerate', '5'] : []),
                 '-re',
                 '-i', urlFinal,
                 // Si el logo no está en el servidor, se usa un cuadro transparente para que el canal salga igual (sin logo)
                 ...(LOGO_PATH
                     ? ['-i', LOGO_PATH]
-                    : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
+                    : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba']),
+                // Las imágenes no traen audio: se agrega silencio como tercera entrada
+                ...(esImagen ? ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo'] : [])
             ];
+            const refAudio = esImagen ? '[2:a]' : '[0:a]';
 
-            // Logo: tamaño y posición vienen de LOGO_TAMANO, LOGO_X y LOGO_Y
-            let filterComplex = video.logo ? 
-                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=${LOGO_TAMANO}:${LOGO_TAMANO}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${LOGO_Y}[v1];` : 
-                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`;
+            // Logo: el tamaño viene de LOGO_TAMANO (escalado a 720p); la posición es fija
+            let filterComplex = video.logo ?
+                `[0:v]fps=${FPS_SALIDA},scale=${sel.w}:${sel.h}:flags=${scaleFlags},setsar=1[bg];[1:v]scale=${escPar(LOGO_TAMANO)}:${escPar(LOGO_TAMANO)}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${logoYpx}[v1];` :
+                `[0:v]fps=${FPS_SALIDA},scale=${sel.w}:${sel.h}:flags=${scaleFlags},setsar=1[v1];`;
 
             let etiqueta = 'v1';
 
@@ -1183,9 +1328,9 @@ async function motorCanalC() {
                 const velN = Math.max(40, numAjuste(ajN.cintilloVelocidad, 140));
                 const colorN = /^[0-9a-fA-F]{6}$/.test(String(ajN.cintilloColor || '')) ? ajN.cintilloColor : '0a50c8';
                 const fuenteN = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                filterComplex += `color=c=0x${colorN}:s=1920x70:r=${FPS_SALIDA}[barra];` +
+                filterComplex += `color=c=0x${colorN}:s=${sel.w}x${esc(70)}:r=${FPS_SALIDA}[barra];` +
                                  `[${etiqueta}][barra]overlay=x=0:y='main_h-overlay_h*clip(t-1,0,1)':shortest=1[vn];` +
-                                 `[vn]drawtext=${fuenteN}textfile=${ARCHIVO_CINTILLO}:reload=1:expansion=none:enable='gte(t,2)':x='w-mod((t-2)*${velN},w+tw)':y=main_h-56:fontsize=38:fontcolor=white[vk];`;
+                                 `[vn]drawtext=${fuenteN}textfile=${ARCHIVO_CINTILLO}:reload=1:expansion=none:enable='gte(t,2)':x='w-mod((t-2)*${esc(velN)},w+tw)':y=main_h-${esc(56)}:fontsize=${esc(38)}:fontcolor=white[vk];`;
                 etiqueta = 'vk';
             }
 
@@ -1196,34 +1341,34 @@ async function motorCanalC() {
                 const aj = datasetConfig.ajustes || AJUSTES_DEFECTO;
                 const S = Math.max(0, numAjuste(aj.segundosAparecer, 10));       // segundos tras iniciar el video
                 const p = `clip(t-${S},0,1)`;                                    // Permanece fijo tras aparecer (no se oculta)
-                const desliza = (x0) => `'${x0}-900*(1-${p})'`;                  // animación de entrada desde la izquierda
+                const desliza = (x0) => `'${x0}-${esc(900)}*(1-${p})'`;          // animación de entrada desde la izquierda
 
                 const rutaBanner = imagenesEvento.banner.ruta && fs.existsSync(imagenesEvento.banner.ruta) ? imagenesEvento.banner.ruta : null;
                 const rutaPj = imagenesEvento.personaje.ruta && fs.existsSync(imagenesEvento.personaje.ruta) ? imagenesEvento.personaje.ruta : null;
-                
-                const xCard = rutaPj ? 330 : 50;
-                let idx = 2;
+
+                const xCard = rutaPj ? esc(330) : esc(50);
+                let idx = esImagen ? 3 : 2; // las entradas 0, 1 (y 2 si es imagen) ya están ocupadas
 
                 if (rutaBanner) {
                     ffmpegArgs.push('-i', rutaBanner);
-                    // Banner más ancho (600) y bajado en Y
-                    filterComplex += `[${idx}:v]scale=600:-2[bnr];[${etiqueta}][bnr]overlay=x=${desliza(xCard)}:y=main_h-overlay_h-20[vb];`;
+                    // Banner más ancho (600 en 1080p) y bajado en Y
+                    filterComplex += `[${idx}:v]scale=${escPar(600)}:-2[bnr];[${etiqueta}][bnr]overlay=x=${desliza(xCard)}:y=main_h-overlay_h-${esc(20)}[vb];`;
                     etiqueta = 'vb';
                     idx++;
                 }
                 if (rutaPj) {
                     ffmpegArgs.push('-i', rutaPj);
-                    filterComplex += `[${idx}:v]scale=-2:360[pj];[${etiqueta}][pj]overlay=x=${desliza(30)}:y=main_h-overlay_h-50[vp];`;
+                    filterComplex += `[${idx}:v]scale=-2:${escPar(360)}[pj];[${etiqueta}][pj]overlay=x=${desliza(esc(30))}:y=main_h-overlay_h-${esc(50)}[vp];`;
                     etiqueta = 'vp';
                     idx++;
                 }
                 const fuente = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
                 // Texto de la cuenta regresiva movido un poco más hacia la derecha (xCard + 50)
-                filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
+                filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + esc(50))}:y=main_h-${esc(175)}:fontsize=${esc(42)}:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=${esc(19)}[vt];`;
                 etiqueta = 'vt';
             }
 
-            filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
+            filterComplex += `[${etiqueta}]format=yuv420p[v];${refAudio}aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
 
             ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
             ffmpegArgs.push(
@@ -1245,8 +1390,26 @@ async function motorCanalC() {
                 let lentoDesde = 0, omitidoPorLento = false;
                 const puedeOmitirPorLento = !video.alTerminar && (itemActual.tipo === 'programa_secuencia' || itemActual.tipo === 'gist');
                 let duracionActual = 0, tiempoActual = 0, cortePorHorario = false;
+                let revisandoVivo = false;
 
                 const verificadorHoraFin = setInterval(() => {
+                    // Esperando una retransmisión: en cuanto llega la señal, se corta el video de espera y entra el vivo
+                    if (itemActual.tipo === 'vivo_espera' && !revisandoVivo) {
+                        revisandoVivo = true;
+                        vivoDisponible(itemActual.urlVivo, 4000).then((ok) => {
+                            revisandoVivo = false;
+                            if (ok && procesoActual === ffmpegProc) {
+                                console.log(`📡 [VIVO] Llegó la señal de la retransmisión. Saliendo del video de espera.`);
+                                try { ffmpegProc.kill('SIGKILL'); } catch (e) {}
+                            }
+                        }).catch(() => { revisandoVivo = false; });
+                    }
+                    // Imagen de "sin programación": se quita cuando ya hay algo programado que sacar al aire
+                    if (itemActual.esperaImagen && hayAlgoProgramadoAhora()) {
+                        console.log(`⏰ [HORARIO] Ya hay programación al aire. Se quita la imagen fija.`);
+                        try { ffmpegProc.kill('SIGKILL'); } catch (e) {}
+                    }
+
                     if (itemActual.tipo === 'evento') {
                         // El evento termina cuando su horario acaba o cuando se finaliza desde el panel
                         const e = verificarEstadoEvento();
@@ -1255,7 +1418,7 @@ async function motorCanalC() {
                             ffmpegProc.kill('SIGKILL');
                         }
                     } else if (horaFinBloqueStr && itemActual.corteEstricto) {
-                        // Corte a la fuerza SOLO para himno y vivo (horario estricto).
+                        // Corte a la fuerza SOLO para himno y vivo (horario estricto), también durante la espera del vivo.
                         // Los programas NO se cortan a mitad de video.
                         const { horaStr, horaCompletaStr } = obtenerTiempoVenezuela();
                         if (horaCompletaStr >= horaFinBloqueStr || horaStr >= horaFinBloqueStr) {
