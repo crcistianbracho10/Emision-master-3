@@ -40,7 +40,7 @@ const ARCHIVO_CINTILLO = '/tmp/cintillo.txt';
 const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleosDisponibles())));
 
 // ---------------------------------------------------------------
-// Calidad de salida: SIEMPRE 720p (1280x720). No hay selector ni modo automático.
+// Calidad de salida: SIEMPRE 768p (1366x768). No hay selector ni modo automático.
 // ---------------------------------------------------------------
 const PERFIL = { nombre: '720p', w: 1280, h: 720, kbps: 1000, preset: 'superfast' };
 const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil (1000)
@@ -48,11 +48,11 @@ const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
 // Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
 const SEGUNDOS_CUADRO_CLAVE = 1.5;
-// Logo del canal: el tamaño se cambia con la variable de entorno LOGO_TAMANO (en píxeles).
-// La posición es FIJA (medida sobre el lienzo de 1080p; luego todo se reduce a 720p).
+// Logo del canal (se cambian en las variables de entorno, sin tocar el código):
+// LOGO_TAMANO = tamaño en píxeles (sube o baja), LOGO_X = distancia al borde, LOGO_Y = distancia al borde de arriba.
 const LOGO_TAMANO = Math.max(40, parseInt(process.env.LOGO_TAMANO, 10) || 245);
-const LOGO_X = 170; // fijo: distancia al borde
-const LOGO_Y = 75;  // fijo: distancia al borde de arriba
+const LOGO_X = 170; // fijo
+const LOGO_Y = 75;  // fijo
 // Minutos que tiene el himno para arrancar desde su hora de inicio (si no se le pone "fin" en el himno)
 const HIMNO_VENTANA_MIN = 10;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -390,7 +390,7 @@ async function sincronizarDataset() {
     await actualizarImagenesEvento();
 }
 
-setInterval(sincronizarDataset, 60000);
+setInterval(sincronizarDataset, 45000);
 
 // ---------------------------------------------------------------
 // Salida RTMP: manda la misma señal del canal a un servidor externo (sin recodificar)
@@ -1131,14 +1131,14 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            // Posición horizontal del logo (LOGO_X fijo)
+            // Posición horizontal del logo (LOGO_X)
             let xPos = video.logoDer ? `main_w-overlay_w-${LOGO_X}` : String(LOGO_X);
             const urlFinal = corregirUrl(video.url);
 
             // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
             const modoC = (datasetConfig.ajustes || AJUSTES_DEFECTO).modoCodificacion || 'equilibrado';
             const scaleFlags = modoC === 'calidad' ? 'lanczos' : (modoC === 'ligero' ? 'fast_bilinear' : 'bilinear');
-            // La composición (logo, banner, barra) se hace en 1080p y al final se reduce SIEMPRE a 720p
+            // La composición (logo, banner, barra) se hace en 1080p y al final se reduce SIEMPRE a 768p
             const sel = PERFIL;
             const kbpsV = BITRATE_VIDEO || sel.kbps;
             const bitrateV = `${kbpsV}k`;
@@ -1169,16 +1169,10 @@ async function motorCanalC() {
                     : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
             ];
 
-            // Videos sin logo y sin banner (intros, publicidad, clasificación, "a continuación"):
-            // se escalan directo a 720p, sin pasar por el lienzo de 1080p (ahorra CPU).
-            const directo720 = !video.logo && !video.permiteBanner;
-
-            // Logo: tamaño desde LOGO_TAMANO; posición fija (LOGO_X, LOGO_Y)
-            let filterComplex = video.logo ?
-                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=${LOGO_TAMANO}:${LOGO_TAMANO}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${LOGO_Y}[v1];` :
-                (directo720
-                    ? `[0:v]fps=${FPS_SALIDA},scale=${sel.w}:${sel.h}:flags=${scaleFlags},setsar=1[v1];`
-                    : `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`);
+            // Logo: tamaño y posición vienen de LOGO_TAMANO, LOGO_X y LOGO_Y
+            let filterComplex = video.logo ? 
+                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=${LOGO_TAMANO}:${LOGO_TAMANO}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${LOGO_Y}[v1];` : 
+                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`;
 
             let etiqueta = 'v1';
 
