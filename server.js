@@ -48,13 +48,6 @@ const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
 // Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
 const SEGUNDOS_CUADRO_CLAVE = 1.5;
-// Logo del canal (se cambian en las variables de entorno, sin tocar el código):
-// LOGO_TAMANO = tamaño en píxeles (sube o baja), LOGO_X = distancia al borde, LOGO_Y = distancia al borde de arriba.
-const LOGO_TAMANO = Math.max(40, parseInt(process.env.LOGO_TAMANO, 10) || 245);
-const LOGO_X = Math.max(0, parseInt(process.env.LOGO_X, 10) || 170);
-const LOGO_Y = Math.max(0, parseInt(process.env.LOGO_Y, 10) || 75);
-// Minutos que tiene el himno para arrancar desde su hora de inicio (si no se le pone "fin" en el himno)
-const HIMNO_VENTANA_MIN = 10;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const DIR_OVERRIDES = '/tmp/overrides';
 const FONT_FILE = [
@@ -91,9 +84,9 @@ let datasetConfig = {
     vivo: [],
     programacion: [],
     himno: [
-        { url: HIMNO_OFICIAL_URL, inicio: "06:00:00" },
-        { url: HIMNO_OFICIAL_URL, inicio: "00:00:00" },
-        { url: HIMNO_OFICIAL_URL, inicio: "18:00:00" }
+        { url: HIMNO_OFICIAL_URL, inicio: "06:00:00", fin: "06:04:30" }, 
+        { url: HIMNO_OFICIAL_URL, inicio: "00:00:00", fin: "00:04:30" }, 
+        { url: HIMNO_OFICIAL_URL, inicio: "18:00:00", fin: "18:04:30" }
     ],
     intros: [],
     publicidad: [],
@@ -280,12 +273,6 @@ function convertirSegundos(horaStr) {
     const m = partes[1] || 0;
     const s = partes[2] || 0;
     return h * 3600 + m * 60 + s;
-}
-
-function sumarSegundosHora(horaStr, seg) {
-    const t = (convertirSegundos(horaStr) + seg) % 86400;
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${pad(Math.floor(t / 3600))}:${pad(Math.floor((t % 3600) / 60))}:${pad(t % 60)}`;
 }
 
 function estaEnHorario(inicio, fin, horaActualStr) {
@@ -788,8 +775,7 @@ function obtenerElementoActualEnEmision() {
     if (datasetConfig.himno && datasetConfig.himno.length > 0) {
         for (let hItem of datasetConfig.himno) {
             let idHimnoUnico = `${fechaHoyStr}-${hItem.inicio}`;
-            const finVentana = hItem.fin || sumarSegundosHora(hItem.inicio, HIMNO_VENTANA_MIN * 60);
-            if (estaEnHorario(hItem.inicio, finVentana, horaCompletaStr)) {
+            if (estaEnHorario(hItem.inicio, hItem.fin, horaCompletaStr)) {
                 if (ultimoHimnoReproducido !== idHimnoUnico) {
                     estadoActualTransmision.tituloActual = "Himno Nacional";
                     estadoActualTransmision.programaActual = "Transmisión Oficial";
@@ -797,7 +783,8 @@ function obtenerElementoActualEnEmision() {
                     return {
                         tipo: 'himno',
                         idUnico: idHimnoUnico,
-                        // Sin corte por horario: el himno siempre se reproduce completo
+                        horaFinBloque: hItem.fin,
+                        corteEstricto: true,
                         secuencia: [{ url: corregirUrl(hItem.url), logo: true, logoDer: false, desc: "Himno Nacional" }]
                     };
                 }
@@ -1131,13 +1118,23 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            // MODO COPY PURO: sin logo, filtros, banners, escalado ni recodificación.
-            // Se conserva el video/audio original. Para que RTMP funcione, la fuente
-            // debe ser compatible (normalmente H.264 + AAC).
+            // Logo un poco más cerca de la esquina (170 en vez de 200)
+            let xPos = video.logoDer ? "main_w-overlay_w-170" : "170";
             const urlFinal = corregirUrl(video.url);
+
+            // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
+            const modoC = (datasetConfig.ajustes || AJUSTES_DEFECTO).modoCodificacion || 'equilibrado';
+            const scaleFlags = modoC === 'calidad' ? 'lanczos' : (modoC === 'ligero' ? 'fast_bilinear' : 'bilinear');
+            // La composición (logo, banner, barra) se hace en 1080p y al final se reduce SIEMPRE a 768p
+            const sel = PERFIL;
+            const kbpsV = BITRATE_VIDEO || sel.kbps;
+            const bitrateV = `${kbpsV}k`;
+            const maxrateV = `${Math.round(kbpsV * 1.5)}k`; // permite ráfagas: sale más rápido cuando hace falta
+            const bufsizeV = `${Math.round(kbpsV * 3)}k`; // búfer más grande: evita que el reproductor se quede cargando
+            const presetX264 = sel.preset;
             console.log(`\n📺 AIRE: ${video.desc}`);
-            console.log('⚙️ [COPY] Video y audio originales; sin logo ni filtros.');
-            console.log('🖼️ [LOGO] Desactivado en esta versión.');
+            console.log(`⚙️ [CALIDAD] ${sel.nombre} fija | ${sel.w}x${sel.h} | video ${kbpsV}k + audio ${BITRATE_AUDIO}k | ${FPS_SALIDA} fps | cuadro clave cada ${SEGUNDOS_CUADRO_CLAVE}s | x264 ${presetX264} | hilos ${HILOS}`);
+            console.log(`🖼️ [LOGO] ${video.logo ? (LOGO_PATH ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
 
             let ffmpegArgs = [
                 '-reconnect', '1',
@@ -1149,19 +1146,81 @@ async function motorCanalC() {
                 '-user_agent', UA_NAVEGADOR,
                 '-probesize', '2M',
                 '-analyzeduration', '2000000',
-                '-thread_queue_size', '512',
+                ...(HILOS ? ['-threads', HILOS, '-filter_complex_threads', HILOS] : []),
                 '-re',
                 '-i', urlFinal,
-                '-map', '0:v:0',
-                '-map', '0:a:0?',
-                '-c:v', 'copy',
-                '-c:a', 'copy',
-                '-max_muxing_queue_size', '1024',
-                '-muxdelay', '0',
-                '-flush_packets', '1',
-                '-f', 'mpegts',
-                'udp://127.0.0.1:9999?pkt_size=1316'
+                // Si el logo no está en el servidor, se usa un cuadro transparente para que el canal salga igual (sin logo)
+                ...(LOGO_PATH
+                    ? ['-i', LOGO_PATH]
+                    : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
             ];
+
+            // Logo: tamaño 245 (antes 250) y posición Y 75 (antes 90)
+            let filterComplex = video.logo ? 
+                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=245:245:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:75[v1];` : 
+                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`;
+
+            let etiqueta = 'v1';
+
+            // Barra de noticias (azul, abajo): sube deslizando y el texto corre de derecha a izquierda.
+            // Va DEBAJO del banner del evento (el banner queda encima y no se mueve).
+            const ajN = datasetConfig.ajustes || AJUSTES_DEFECTO;
+            if (video.permiteBanner && ajN.cintilloActivo && String(ajN.cintilloTexto || '').trim() !== '') {
+                const velN = Math.max(40, numAjuste(ajN.cintilloVelocidad, 140));
+                const colorN = /^[0-9a-fA-F]{6}$/.test(String(ajN.cintilloColor || '')) ? ajN.cintilloColor : '0a50c8';
+                const fuenteN = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
+                filterComplex += `color=c=0x${colorN}:s=1920x70:r=${FPS_SALIDA}[barra];` +
+                                 `[${etiqueta}][barra]overlay=x=0:y='main_h-overlay_h*clip(t-1,0,1)':shortest=1[vn];` +
+                                 `[vn]drawtext=${fuenteN}textfile=${ARCHIVO_CINTILLO}:reload=1:expansion=none:enable='gte(t,2)':x='w-mod((t-2)*${velN},w+tw)':y=main_h-56:fontsize=38:fontcolor=white[vk];`;
+                etiqueta = 'vk';
+            }
+
+            // Cuenta regresiva del evento: solo en programación (episodios, retransmisiones y gist),
+            // nunca en publicidad, intros ni clasificación.
+            const estEv = video.permiteBanner ? verificarEstadoEvento() : null;
+            if (estEv && estEv.tipo === 'proximo') {
+                const aj = datasetConfig.ajustes || AJUSTES_DEFECTO;
+                const S = Math.max(0, numAjuste(aj.segundosAparecer, 10));       // segundos tras iniciar el video
+                const p = `clip(t-${S},0,1)`;                                    // Permanece fijo tras aparecer (no se oculta)
+                const desliza = (x0) => `'${x0}-900*(1-${p})'`;                  // animación de entrada desde la izquierda
+
+                const rutaBanner = imagenesEvento.banner.ruta && fs.existsSync(imagenesEvento.banner.ruta) ? imagenesEvento.banner.ruta : null;
+                const rutaPj = imagenesEvento.personaje.ruta && fs.existsSync(imagenesEvento.personaje.ruta) ? imagenesEvento.personaje.ruta : null;
+                
+                const xCard = rutaPj ? 330 : 50;
+                let idx = 2;
+
+                if (rutaBanner) {
+                    ffmpegArgs.push('-i', rutaBanner);
+                    // Banner más ancho (600) y bajado en Y
+                    filterComplex += `[${idx}:v]scale=600:-2[bnr];[${etiqueta}][bnr]overlay=x=${desliza(xCard)}:y=main_h-overlay_h-20[vb];`;
+                    etiqueta = 'vb';
+                    idx++;
+                }
+                if (rutaPj) {
+                    ffmpegArgs.push('-i', rutaPj);
+                    filterComplex += `[${idx}:v]scale=-2:360[pj];[${etiqueta}][pj]overlay=x=${desliza(30)}:y=main_h-overlay_h-50[vp];`;
+                    etiqueta = 'vp';
+                    idx++;
+                }
+                const fuente = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
+                // Texto de la cuenta regresiva movido un poco más hacia la derecha (xCard + 50)
+                filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
+                etiqueta = 'vt';
+            }
+
+            filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
+
+            ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
+            ffmpegArgs.push(
+                '-c:v', 'libx264', '-preset', presetX264, '-tune', 'zerolatency',
+                ...(HILOS ? ['-threads', HILOS] : []),
+                '-b:v', bitrateV, '-maxrate', maxrateV, '-bufsize', bufsizeV,
+                '-g', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-keyint_min', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-sc_threshold', '0',
+                '-c:a', 'aac', '-b:a', `${BITRATE_AUDIO}k`, '-ac', '2',
+                '-muxdelay', '0', '-flush_packets', '1',
+                '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
+            );
 
             await new Promise((resolve) => {
                 const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
@@ -1253,7 +1312,7 @@ async function motorCanalC() {
                 });
 
                 const watchdogCongelamiento = setInterval(() => {
-                    if (Date.now() - ultimoFrame > 15000) {
+                    if (Date.now() - ultimoFrame > 25000) {
                         console.log(`⚠️ [WATCHDOG] El video "${video.desc}" se congeló. Forzando reinicio del proceso.`);
                         ffmpegProc.kill('SIGKILL');
                     }
