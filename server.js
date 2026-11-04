@@ -29,6 +29,7 @@ const RTMP_URL = (process.env.RTMP_URL || "").trim();
 const RTMP_PUENTE_PUERTO = 9999;
 
 const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/6e4a07d268460ea807abf28f77c3880e/raw";
+const FALLBACK_IMAGE = "https://www.dropbox.com/scl/fi/x9xpsosc6mlmn5rw8e2at/Copilot_20260224_002036.png?rlkey=340kgc42pa64ytajhzv0vl53b&st=qr7ly3ru&dl=1";
 const BANNER_EVENTO_DEFECTO = "https://ibb.co/KpGf6Zxp";
 const BANNER_RESPALDO_DEFECTO = "https://i.postimg.cc/v8vXL9BV/images-(1)-(1).png";
 const ARCHIVO_ESTADO_PERSISTENTE = '/tmp/estado_episodios.json';
@@ -39,19 +40,19 @@ const ARCHIVO_CINTILLO = '/tmp/cintillo.txt';
 const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleosDisponibles())));
 
 // ---------------------------------------------------------------
-// Calidad de salida fija: 720p para reducir carga y mantener fluidez.
- // ---------------------------------------------------------------
-const PERFIL = { nombre: '720p', w: 1280, h: 720, kbps: 2500, preset: 'superfast' };
+// Calidad de salida: SIEMPRE 768p (1366x768). No hay selector ni modo automático.
+// ---------------------------------------------------------------
+const PERFIL = { nombre: '768p', w: 1366, h: 768, kbps: 1000, preset: 'superfast' };
 const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil (1000)
 const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96); // kbps
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
 // Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
 const SEGUNDOS_CUADRO_CLAVE = 1.5;
 // Logo del canal (se cambian en las variables de entorno, sin tocar el código):
-// El logo conserva tamaño configurable y queda en una posición fija (170 px desde la izquierda y 75 px desde arriba).
+// LOGO_TAMANO = tamaño en píxeles (sube o baja), LOGO_X = distancia al borde, LOGO_Y = distancia al borde de arriba.
 const LOGO_TAMANO = Math.max(40, parseInt(process.env.LOGO_TAMANO, 10) || 245);
-const LOGO_POS_X = 170;
-const LOGO_POS_Y = 75;
+const LOGO_X = Math.max(0, parseInt(process.env.LOGO_X, 10) || 170);
+const LOGO_Y = Math.max(0, parseInt(process.env.LOGO_Y, 10) || 75);
 // Minutos que tiene el himno para arrancar desde su hora de inicio (si no se le pone "fin" en el himno)
 const HIMNO_VENTANA_MIN = 10;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -612,7 +613,7 @@ setInterval(() => {
 }, SEGUNDOS_LOG_CPU * 1000);
 
 function corregirUrl(url) {
-    if (!url) return "";
+    if (!url) return FALLBACK_IMAGE;
     if (url.includes("dropbox.com")) {
         return url.replace(/www\.dropbox\.com/, "dl.dropboxusercontent.com")
                   .replace(/\?dl=0/, "").replace(/\?dl=1/, "");
@@ -966,10 +967,13 @@ function obtenerElementoActualEnEmision() {
         };
     }
 
-    estadoActualTransmision.tituloActual = "Esperando programación de Gist";
-    estadoActualTransmision.programaActual = "Respaldo Gist";
-    estadoActualTransmision.aContinuacion = "Esperando lista de Gist";
-    return { tipo: 'sin_gist', secuencia: [] };
+    estadoActualTransmision.tituloActual = "Señal de Ajuste";
+    estadoActualTransmision.programaActual = "Mantenimiento";
+    estadoActualTransmision.aContinuacion = "Ninguna";
+    return {
+        tipo: 'fallback',
+        secuencia: [{ url: FALLBACK_IMAGE, logo: true, logoDer: false, desc: "Imagen de Salvación" }]
+    };
 }
 
 function getVideoClasificacionPorHora(horaStr) {
@@ -1070,14 +1074,6 @@ async function motorCanalC() {
             itemActual = obtenerElementoActualEnEmision();
         }
 
-        // Si no hay programación normal ni elementos Gist, vuelve a consultar Gist y espera sin emitir una imagen de espera.
-        if (itemActual.tipo === 'sin_gist' || (itemActual.tipo === 'gist' && (!itemActual.secuencia || itemActual.secuencia.length === 0))) {
-            console.log('⚠️ [GIST] No hay elementos disponibles. Reintentando cargar la lista en 10 segundos...');
-            await sincronizarDataset();
-            await new Promise(resolve => setTimeout(resolve, 10000));
-            continue;
-        }
-
         // Si es himno, registramos que ya se reprodujo para este bloque exacto
         if (itemActual.tipo === 'himno' && itemActual.idUnico) {
             ultimoHimnoReproducido = itemActual.idUnico;
@@ -1135,119 +1131,37 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            // Posición fija del logo; ya no depende de variables LOGO_X / LOGO_Y.
-            const xPos = String(LOGO_POS_X);
+            // MODO COPY PURO: sin logo, filtros, banners, escalado ni recodificación.
+            // Se conserva el video/audio original. Para que RTMP funcione, la fuente
+            // debe ser compatible (normalmente H.264 + AAC).
             const urlFinal = corregirUrl(video.url);
-
-            // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
-            const modoC = (datasetConfig.ajustes || AJUSTES_DEFECTO).modoCodificacion || 'equilibrado';
-            const scaleFlags = modoC === 'calidad' ? 'lanczos' : (modoC === 'ligero' ? 'fast_bilinear' : 'bilinear');
-            // La composición se hace directamente a 720p para reducir trabajo de escalado
-            const sel = PERFIL;
-            const kbpsV = BITRATE_VIDEO || sel.kbps;
-            const bitrateV = `${kbpsV}k`;
-            const maxrateV = `${Math.round(kbpsV * 1.5)}k`; // permite ráfagas: sale más rápido cuando hace falta
-            const bufsizeV = `${Math.round(kbpsV * 3)}k`; // búfer más grande: evita que el reproductor se quede cargando
-            const presetX264 = sel.preset;
             console.log(`\n📺 AIRE: ${video.desc}`);
-            console.log(`⚙️ [CALIDAD] ${sel.nombre} fija | ${sel.w}x${sel.h} | video ${kbpsV}k + audio ${BITRATE_AUDIO}k | ${FPS_SALIDA} fps | cuadro clave cada ${SEGUNDOS_CUADRO_CLAVE}s | x264 ${presetX264} | hilos ${HILOS}`);
-            console.log(`🖼️ [LOGO] ${video.logo ? (LOGO_PATH ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
+            console.log('⚙️ [COPY] Video y audio originales; sin logo ni filtros.');
+            console.log('🖼️ [LOGO] Desactivado en esta versión.');
 
-            const esFondoNegro = video.fondoNegro === true;
             let ffmpegArgs = [
-                ...(HILOS ? ['-threads', HILOS, '-filter_complex_threads', HILOS] : []),
+                '-reconnect', '1',
+                '-reconnect_streamed', '1',
+                '-reconnect_delay_max', '5',
+                '-timeout', '20000000',
+                '-fflags', '+genpts+ignidx+discardcorrupt',
+                '-err_detect', 'ignore_err',
+                '-user_agent', UA_NAVEGADOR,
+                '-probesize', '2M',
+                '-analyzeduration', '2000000',
                 '-thread_queue_size', '512',
                 '-re',
-                ...(esFondoNegro
-                    ? ['-f', 'lavfi', '-i', `color=c=black:s=${sel.w}x${sel.h}:r=${FPS_SALIDA}`,
-                       '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100']
-                    : [
-                        '-reconnect', '1',
-                        '-reconnect_streamed', '1',
-                        '-reconnect_delay_max', '5',
-                        '-timeout', '20000000',
-                        '-fflags', '+genpts+ignidx+discardcorrupt',
-                        '-err_detect', 'ignore_err',
-                        '-user_agent', UA_NAVEGADOR,
-                        '-probesize', '2M',
-                        '-analyzeduration', '2000000',
-                        '-i', urlFinal
-                    ]),
-                // En señal negra el audio es silencio generado; en vídeos se usa el audio de la fuente.
-                ...(LOGO_PATH
-                    ? ['-i', LOGO_PATH]
-                    : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
-            ];
-
-            // Logo: tamaño configurable y posición fija.
-            const indiceLogo = esFondoNegro ? 2 : 1;
-            const indiceAudio = esFondoNegro ? 1 : 0;
-            let filterComplex = video.logo ?
-                `[0:v]fps=${FPS_SALIDA},scale=${sel.w}:${sel.h}:flags=${scaleFlags},setsar=1[bg];[${indiceLogo}:v]scale=${LOGO_TAMANO}:${LOGO_TAMANO}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${LOGO_POS_Y}[v1];` :
-                `[0:v]fps=${FPS_SALIDA},scale=${sel.w}:${sel.h}:flags=${scaleFlags},setsar=1[v1];`;
-
-            let etiqueta = 'v1';
-
-            // Barra de noticias (azul, abajo): sube deslizando y el texto corre de derecha a izquierda.
-            // Va DEBAJO del banner del evento (el banner queda encima y no se mueve).
-            const ajN = datasetConfig.ajustes || AJUSTES_DEFECTO;
-            if (false && video.permiteBanner && ajN.cintilloActivo && String(ajN.cintilloTexto || '').trim() !== '') { // Desactivado para reducir filtros
-                const velN = Math.max(40, numAjuste(ajN.cintilloVelocidad, 140));
-                const colorN = /^[0-9a-fA-F]{6}$/.test(String(ajN.cintilloColor || '')) ? ajN.cintilloColor : '0a50c8';
-                const fuenteN = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                filterComplex += `color=c=0x${colorN}:s=1920x70:r=${FPS_SALIDA}[barra];` +
-                                 `[${etiqueta}][barra]overlay=x=0:y='main_h-overlay_h*clip(t-1,0,1)':shortest=1[vn];` +
-                                 `[vn]drawtext=${fuenteN}textfile=${ARCHIVO_CINTILLO}:reload=1:expansion=none:enable='gte(t,2)':x='w-mod((t-2)*${velN},w+tw)':y=main_h-56:fontsize=38:fontcolor=white[vk];`;
-                etiqueta = 'vk';
-            }
-
-            // Cuenta regresiva del evento: solo en programación (episodios, retransmisiones y gist),
-            // nunca en publicidad, intros ni clasificación.
-            const estEv = video.permiteBanner ? verificarEstadoEvento() : null;
-            if (false && estEv && estEv.tipo === 'proximo') { // Banner y cuenta regresiva desactivados
-                const aj = datasetConfig.ajustes || AJUSTES_DEFECTO;
-                const S = Math.max(0, numAjuste(aj.segundosAparecer, 10));       // segundos tras iniciar el video
-                const p = `clip(t-${S},0,1)`;                                    // Permanece fijo tras aparecer (no se oculta)
-                const desliza = (x0) => `'${x0}-900*(1-${p})'`;                  // animación de entrada desde la izquierda
-
-                const rutaBanner = imagenesEvento.banner.ruta && fs.existsSync(imagenesEvento.banner.ruta) ? imagenesEvento.banner.ruta : null;
-                const rutaPj = imagenesEvento.personaje.ruta && fs.existsSync(imagenesEvento.personaje.ruta) ? imagenesEvento.personaje.ruta : null;
-                
-                const xCard = rutaPj ? 330 : 50;
-                let idx = 2;
-
-                if (rutaBanner) {
-                    ffmpegArgs.push('-i', rutaBanner);
-                    // Banner más ancho (600) y bajado en Y
-                    filterComplex += `[${idx}:v]scale=600:-2[bnr];[${etiqueta}][bnr]overlay=x=${desliza(xCard)}:y=main_h-overlay_h-20[vb];`;
-                    etiqueta = 'vb';
-                    idx++;
-                }
-                if (rutaPj) {
-                    ffmpegArgs.push('-i', rutaPj);
-                    filterComplex += `[${idx}:v]scale=-2:360[pj];[${etiqueta}][pj]overlay=x=${desliza(30)}:y=main_h-overlay_h-50[vp];`;
-                    etiqueta = 'vp';
-                    idx++;
-                }
-                const fuente = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                // Texto de la cuenta regresiva movido un poco más hacia la derecha (xCard + 50)
-                filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
-                etiqueta = 'vt';
-            }
-
-            filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[${indiceAudio}:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
-
-            ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
-            ffmpegArgs.push(
-                '-c:v', 'libx264', '-preset', presetX264, '-tune', 'zerolatency',
-                ...(HILOS ? ['-threads', HILOS] : []),
-                '-b:v', bitrateV, '-maxrate', maxrateV, '-bufsize', bufsizeV,
-                '-g', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-keyint_min', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-sc_threshold', '0',
-                '-c:a', 'aac', '-b:a', `${BITRATE_AUDIO}k`, '-ac', '2',
+                '-i', urlFinal,
+                '-map', '0:v:0',
+                '-map', '0:a:0?',
+                '-c:v', 'copy',
+                '-c:a', 'copy',
                 '-max_muxing_queue_size', '1024',
-                '-muxdelay', '0', '-flush_packets', '1',
-                '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
-            );
+                '-muxdelay', '0',
+                '-flush_packets', '1',
+                '-f', 'mpegts',
+                'udp://127.0.0.1:9999?pkt_size=1316'
+            ];
 
             await new Promise((resolve) => {
                 const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
