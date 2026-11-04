@@ -42,7 +42,7 @@ const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleo
 // ---------------------------------------------------------------
 // Calidad de salida: SIEMPRE 768p (1366x768). No hay selector ni modo automático.
 // ---------------------------------------------------------------
-const PERFIL = { nombre: '768p', w: 1366, h: 768, kbps: 1000, preset: 'superfast' };
+const PERFIL = { nombre: '720p', w: 1280, h: 720, kbps: 1000, preset: 'superfast' };
 const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil (1000)
 const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96); // kbps
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
