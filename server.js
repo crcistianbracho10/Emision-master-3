@@ -22,11 +22,11 @@ const port = process.env.PORT || 8080; // blitz.cloud lee el puerto declarado en
 const DATASET_REPO_ID = process.env.DATASET_REPO_ID || "cristianbracho904/programacion-tv";
 const DATASET_BRANCH = process.env.DATASET_BRANCH || "main";
 const HF_TOKEN = process.env.HF_TOKEN || "";
-// Salida RTMP (opcional): URL completa de ingesta, con la clave y los tokens. NUNCA va en el código (la imagen es pública),
-// solo en las variables de entorno. Ejemplo: rtmp://live.opencaster.com/opencaster/NOMBRE?psk=...&tk=...
-const RTMP_URL = (process.env.RTMP_URL || "").trim();
-// El canal sale SOLO por RTMP (ya no se crean archivos HLS). El codificador manda la señal al puerto local 9999 y de ahí la toma el proceso RTMP.
-const RTMP_PUENTE_PUERTO = 9999;
+// Salida HLS local: no requiere RTMP ni una página web. Express publica el .m3u8 y sus segmentos.
+const HLS_DIR = process.env.HLS_DIR || '/tmp/canalc-hls';
+const HLS_PLAYLIST = path.join(HLS_DIR, 'live.m3u8');
+const HLS_PUENTE_PUERTO = 9999;
+fs.mkdirSync(HLS_DIR, { recursive: true });
 
 const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/6e4a07d268460ea807abf28f77c3880e/raw";
 const FALLBACK_IMAGE = "https://www.dropbox.com/scl/fi/x9xpsosc6mlmn5rw8e2at/Copilot_20260224_002036.png?rlkey=340kgc42pa64ytajhzv0vl53b&st=qr7ly3ru&dl=1";
@@ -48,11 +48,6 @@ const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
 // Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
 const SEGUNDOS_CUADRO_CLAVE = 1.5;
-// Logo del canal: el tamaño se cambia con la variable de entorno LOGO_TAMANO (en píxeles).
-// La posición es FIJA (medida sobre el lienzo de 1080p; luego todo se reduce a 720p).
-const LOGO_TAMANO = Math.max(40, parseInt(process.env.LOGO_TAMANO, 10) || 245);
-const LOGO_X = 170; // fijo: distancia al borde
-const LOGO_Y = 75;  // fijo: distancia al borde de arriba
 // Minutos que tiene el himno para arrancar desde su hora de inicio (si no se le pone "fin" en el himno)
 const HIMNO_VENTANA_MIN = 10;
 const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -70,6 +65,13 @@ if (!fs.existsSync(DIR_OVERRIDES)) {
 }
 
 app.use(express.json({ limit: '5mb' }));
+app.use('/hls', express.static(HLS_DIR, {
+    setHeaders: (res, filePath) => {
+        if (filePath.endsWith('.m3u8')) res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        else if (filePath.endsWith('.ts')) res.setHeader('Content-Type', 'video/mp2t');
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    }
+}));
 
 const AJUSTES_DEFECTO = {
     bannerUrl: BANNER_EVENTO_DEFECTO,
@@ -299,8 +301,34 @@ function estaEnHorario(inicio, fin, horaActualStr) {
     }
 }
 
+// Devuelve la URL pública usando el host/protocolo que entrega el proxy de la plataforma.
+// Si el alojamiento ofrece una IP pública directa, se puede fijar con PUBLIC_BASE_URL
+// (por ejemplo: http://203.0.113.10:8080). No se inventa una IP: la asigna el proveedor.
+function obtenerBasePublica(req) {
+    const configurada = String(process.env.PUBLIC_BASE_URL || '').trim().replace(/\/$/, '');
+    if (configurada) return configurada;
+    const forwardedHost = req.headers['x-forwarded-host'];
+    const host = String((Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost) || req.headers.host || `localhost:${port}`).split(',')[0].trim();
+    const forwardedProto = req.headers['x-forwarded-proto'];
+    const proto = String((Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) || (req.secure ? 'https' : 'http')).split(',')[0].trim();
+    return `${proto}://${host}`;
+}
+
+app.get('/api/hls-url', (req, res) => {
+    const base = obtenerBasePublica(req);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+        canal: 'Canal C',
+        playlist: `${base}/hls/live.m3u8`,
+        nombre: 'live.m3u8',
+        ruta: '/hls/live.m3u8',
+        nota: 'La URL usa el host público entregado por la plataforma. Una IP directa solo funciona si el proveedor asigna una IP pública y permite el puerto.'
+    });
+});
+
 app.get('/', (req, res) => {
-    res.send('Canal C transmitiendo por RTMP.');
+    const playlist = `${obtenerBasePublica(req)}/hls/live.m3u8`;
+    res.type('text/plain').send(`Canal C HLS\nSeñal M3U8: ${playlist}\nInformación: ${obtenerBasePublica(req)}/api/hls-url\n`);
 });
 
 app.get('/api/estado', (req, res) => {
@@ -387,169 +415,57 @@ async function sincronizarDataset() {
         const gistRes = await axios.get(GIST_FALLBACK_URL);
         datasetConfig.playlistGist = Array.isArray(gistRes.data) ? gistRes.data : JSON.parse(gistRes.data);
     } catch (e) {}
-    await actualizarImagenesEvento();
 }
 
 setInterval(sincronizarDataset, 60000);
 
 // ---------------------------------------------------------------
-// Salida RTMP: manda la misma señal del canal a un servidor externo (sin recodificar)
+// Salida HLS: toma el flujo MPEG-TS local y crea /hls/live.m3u8.
+// Este proceso permanece abierto entre los videos de la programación.
 // ---------------------------------------------------------------
-let procesoRtmp = null;
-let reintentoRtmp = null;
+let procesoHls = null;
+let reintentoHls = null;
 
-function ocultarClaveRtmp(texto) {
-    // Nunca se escribe la clave en el registro (el panel y los logs pueden verse)
-    return RTMP_URL ? String(texto).split(RTMP_URL).join('rtmp://***') : String(texto);
-}
-
-function iniciarRTMP() {
-    if (!RTMP_URL) return;
-    if (reintentoRtmp) { clearTimeout(reintentoRtmp); reintentoRtmp = null; }
-    if (procesoRtmp) {
-        try { procesoRtmp.removeAllListeners('close'); procesoRtmp.kill('SIGKILL'); } catch (e) {}
+function iniciarHLS() {
+    if (reintentoHls) { clearTimeout(reintentoHls); reintentoHls = null; }
+    if (procesoHls) {
+        try { procesoHls.removeAllListeners('close'); procesoHls.kill('SIGKILL'); } catch (e) {}
     }
-    let hostRtmp = '';
-    try { hostRtmp = new URL(RTMP_URL).host; } catch (e) { hostRtmp = '(RTMP_URL no es una URL válida)'; }
-    console.log(`📡 [RTMP] Conectando salida RTMP a ${hostRtmp} ...`);
-    const proc = spawn('ffmpeg', [
-        '-fflags', '+nobuffer+genpts',
-        '-probesize', '500000',
-        '-analyzeduration', '500000',
-        '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
-        '-c:v', 'copy',
-        '-c:a', 'copy',
-        '-bsf:a', 'aac_adtstoasc',
-        '-flush_packets', '1',
-        '-f', 'flv',
-        RTMP_URL
-    ]);
-    procesoRtmp = proc;
-    let conectado = false;
-    let yaPublicando = false;
-    let lineasMostradas = 0;
-    let ultimoEstado = 0;
-    const avisoSinSenal = setTimeout(() => {
-        if (!conectado) console.log('⏳ [RTMP] Pasaron 40s y no llegan datos de video al RTMP: o el codificador aún no arranca (revisa los logs de arriba) o el servidor RTMP no respondió.');
-    }, 40000);
-    proc.stderr.on('data', (data) => {
-        const msg = data.toString().trim();
-        if (!msg) return;
-        if (/Already publishing/i.test(msg)) yaPublicando = true;
-        if (msg.includes('frame=')) {
-            if (!conectado) {
-                conectado = true;
-                console.log('✅ [RTMP] Transmitiendo al servidor RTMP.');
+    try {
+        fs.mkdirSync(HLS_DIR, { recursive: true });
+        console.log('📡 [HLS] Publicando lista local: /hls/live.m3u8');
+        const proc = spawn('ffmpeg', [
+            '-hide_banner', '-loglevel', 'warning',
+            '-fflags', '+genpts+discardcorrupt',
+            '-i', `udp://127.0.0.1:${HLS_PUENTE_PUERTO}?fifo_size=1000000&overrun_nonfatal=1`,
+            '-map', '0:v:0', '-map', '0:a?',
+            '-c:v', 'copy', '-c:a', 'copy',
+            '-f', 'hls',
+            '-hls_time', '4',
+            '-hls_list_size', '8',
+            '-hls_flags', 'delete_segments+append_list+omit_endlist',
+            '-hls_segment_filename', path.join(HLS_DIR, 'segment_%06d.ts'),
+            HLS_PLAYLIST
+        ]);
+        procesoHls = proc;
+        proc.stderr.on('data', d => {
+            const msg = d.toString().trim();
+            if (msg && /error|failed|invalid|could not|non-monoton/i.test(msg)) {
+                console.log(`[HLS] ${msg.slice(0, 300)}`);
             }
-            if (Date.now() - ultimoEstado > 60000) {
-                ultimoEstado = Date.now();
-                console.log(`📊 [RTMP] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)}`);
-            }
-            return;
-        }
-        if (/decode_slice_header|non-existing PPS|Last message repeated|co located POCs|mmco|reference picture missing|Packet corrupt|no frame/i.test(msg)) return;
-        // Muestra lo primero que dice ffmpeg (entrada, salida, errores) para poder diagnosticar; la clave se oculta.
-        if (lineasMostradas < 40 || /error|failed|refused|timed out|denied|unauthorized|Input\/output|invalid|not found|Connection/i.test(msg)) {
-            lineasMostradas++;
-            console.log(`[RTMP] ${ocultarClaveRtmp(msg).slice(0, 300)}`);
-        }
-    });
-    proc.on('close', (code, signal) => {
-        clearTimeout(avisoSinSenal);
-        if (yaPublicando) {
-            console.log('⛔ [RTMP] Opencaster dice "Already publishing": ya hay OTRA transmisión usando esta misma clave (otra copia de esta app, un despliegue anterior que sigue encendido, u otro programa/OBS). Apaga la otra o espera a que su sesión expire. Reintento en 20s.');
-            reintentoRtmp = setTimeout(iniciarRTMP, 20000);
-        } else {
-            console.log(`⚠️ [RTMP] La salida RTMP se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
-            reintentoRtmp = setTimeout(iniciarRTMP, 5000);
-        }
-    });
-}
-
-
-// ---------------------------------------------------------------
-// Logo del canal: se busca en varias carpetas (sin importar mayúsculas) y, si no está, se puede bajar de LOGO_URL
-// ---------------------------------------------------------------
-const LOGO_URL = (process.env.LOGO_URL || '').trim();   // cualquier enlace a una imagen (GitHub, Drive, Dropbox, Imgur, etc.)
-let LOGO_PATH = null;
-
-function buscarLogoLocal() {
-    const carpetas = [...new Set([process.cwd(), __dirname, '/app', '/tmp'])];
-    for (const dir of carpetas) {
-        try {
-            const nombre = fs.readdirSync(dir).find(f => f.toLowerCase() === 'canal_c.png');
-            if (nombre) return path.join(dir, nombre);
-        } catch (e) {}
-    }
-    return null;
-}
-
-// Convierte enlaces "de página" (GitHub, Google Drive, Dropbox, Imgur...) en enlaces directos a la imagen
-function enlaceDirectoLogo(u) {
-    u = String(u || '').trim();
-    if (!u) return '';
-    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) u = 'https://' + u.replace(/^\/+/, '');
-    let m;
-    // GitHub: .../blob/rama/archivo.png  ->  raw.githubusercontent.com/...
-    if ((m = u.match(/^https?:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/]+)\/(?:blob|raw)\/(.+?)(?:\?.*)?$/i))) {
-        return `https://raw.githubusercontent.com/${m[1]}/${m[2]}/${m[3]}`;
-    }
-    // Google Drive: /file/d/ID/view  o  open?id=ID
-    if ((m = u.match(/drive\.google\.com\/file\/d\/([^/?#]+)/i)) || (m = u.match(/drive\.google\.com\/(?:open|uc)\?(?:[^#]*&)?id=([^&#]+)/i))) {
-        return `https://drive.google.com/uc?export=download&id=${m[1]}`;
-    }
-    // Dropbox: fuerza la descarga directa
-    if (/dropbox\.com/i.test(u)) {
-        return u.replace(/www\.dropbox\.com/i, 'dl.dropboxusercontent.com').replace(/[?&]dl=[01]/i, '');
-    }
-    // Imgur: página de la imagen -> imagen directa
-    if ((m = u.match(/^https?:\/\/(?:www\.)?imgur\.com\/(?!a\/|gallery\/)([A-Za-z0-9]+)\/?$/i))) {
-        return `https://i.imgur.com/${m[1]}.png`;
-    }
-    return corregirUrl(u); // enlaces de tu dataset privado de Hugging Face (pasan por el servidor con el token)
-}
-
-// Detecta el tipo de imagen por sus primeros bytes (no por la extensión del enlace)
-function tipoImagen(buf) {
-    if (buf.length > 12) {
-        if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'png';
-        if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'jpg';
-        if (buf.slice(0, 4).toString() === 'GIF8') return 'gif';
-        if (buf.slice(0, 4).toString() === 'RIFF' && buf.slice(8, 12).toString() === 'WEBP') return 'webp';
-    }
-    return null;
-}
-
-async function prepararLogo() {
-    LOGO_PATH = null;
-    // 1) Si hay LOGO_URL, manda ese enlace (así puedes cambiar el logo solo cambiando el enlace)
-    if (LOGO_URL) {
-        const directo = enlaceDirectoLogo(LOGO_URL);
-        try {
-            const r = await axios.get(directo, {
-                responseType: 'arraybuffer', timeout: 25000, maxContentLength: 15 * 1024 * 1024,
-                headers: { 'User-Agent': UA_NAVEGADOR }, maxRedirects: 5
-            });
-            const buf = Buffer.from(r.data);
-            const tipo = tipoImagen(buf);
-            if (!tipo) throw new Error('el enlace no devuelve una imagen (png, jpg, gif o webp). Usa un enlace directo a la imagen, no a una página.');
-            LOGO_PATH = `/tmp/logo_descargado.${tipo}`;
-            fs.writeFileSync(LOGO_PATH, buf);
-            console.log(`🖼️ [LOGO] Logo descargado desde LOGO_URL (${tipo}, ${buf.length} bytes).`);
-        } catch (e) {
-            console.log(`❌ [LOGO] No se pudo usar LOGO_URL: ${e.response ? 'HTTP ' + e.response.status : e.message}`);
-        }
-    }
-    // 2) Si no hay enlace (o falló), se busca Canal_C.png en el servidor
-    if (!LOGO_PATH) LOGO_PATH = buscarLogoLocal();
-    if (LOGO_PATH) {
-        console.log(`🖼️ [LOGO] Logo en uso: ${LOGO_PATH} (${fs.statSync(LOGO_PATH).size} bytes)`);
-    } else {
-        let lista = '';
-        try { lista = fs.readdirSync(__dirname).slice(0, 40).join(', '); } catch (e) {}
-        console.log(`❌ [LOGO] No hay logo: el canal sale sin logo. Carpeta de trabajo: ${process.cwd()} | Carpeta del código: ${__dirname}\n   Archivos en la carpeta del código: ${lista}\n   Solución: define LOGO_URL con el enlace a tu logo.`);
+        });
+        proc.on('error', e => console.log(`[HLS] No se pudo iniciar FFmpeg: ${e.message}`));
+        proc.on('close', (code, signal) => {
+            if (procesoHls === proc) procesoHls = null;
+            console.log(`[HLS] El empaquetador terminó (código ${code}, señal ${signal}). Reintentando en 3 s.`);
+            reintentoHls = setTimeout(iniciarHLS, 3000);
+        });
+    } catch (e) {
+        console.log(`[HLS] Error al iniciar salida: ${e.message}`);
+        reintentoHls = setTimeout(iniciarHLS, 5000);
     }
 }
+
 
 // ---------------------------------------------------------------
 // Monitor de CPU y RAM (en vivo, en el registro). Lee el uso REAL del contenedor (cgroup), no el de la máquina completa.
@@ -1055,9 +971,7 @@ function forzarRecalculo() {
 }
 
 async function motorCanalC() {
-    await prepararLogo();
-    if (RTMP_URL) iniciarRTMP();
-    else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
+    iniciarHLS();
     await sincronizarDataset();
     while (true) {
         interrumpirBloque = false;
@@ -1131,117 +1045,33 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            // Posición horizontal del logo (LOGO_X fijo)
-            let xPos = video.logoDer ? `main_w-overlay_w-${LOGO_X}` : String(LOGO_X);
             const urlFinal = corregirUrl(video.url);
-
-            // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
-            const modoC = (datasetConfig.ajustes || AJUSTES_DEFECTO).modoCodificacion || 'equilibrado';
-            const scaleFlags = modoC === 'calidad' ? 'lanczos' : (modoC === 'ligero' ? 'fast_bilinear' : 'bilinear');
-            // La composición (logo, banner, barra) se hace en 1080p y al final se reduce SIEMPRE a 720p
-            const sel = PERFIL;
-            const kbpsV = BITRATE_VIDEO || sel.kbps;
-            const bitrateV = `${kbpsV}k`;
-            const maxrateV = `${Math.round(kbpsV * 1.5)}k`; // permite ráfagas: sale más rápido cuando hace falta
-            const bufsizeV = `${Math.round(kbpsV * 3)}k`; // búfer más grande: evita que el reproductor se quede cargando
-            const presetX264 = sel.preset;
             console.log(`\n📺 AIRE: ${video.desc}`);
-            console.log(`⚙️ [CALIDAD] ${sel.nombre} fija | ${sel.w}x${sel.h} | video ${kbpsV}k + audio ${BITRATE_AUDIO}k | ${FPS_SALIDA} fps | cuadro clave cada ${SEGUNDOS_CUADRO_CLAVE}s | x264 ${presetX264} | hilos ${HILOS}`);
-            console.log(`🖼️ [LOGO] ${video.logo ? (LOGO_PATH ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
-
-            let ffmpegArgs = [
+            console.log('⚙️ [COPY] Sin logo, sin filtros y sin recodificación. Se conserva el códec original.');
+            const ffmpegArgs = [
+                '-hide_banner',
+                '-loglevel', 'info',
                 '-reconnect', '1',
                 '-reconnect_streamed', '1',
                 '-reconnect_delay_max', '5',
                 '-timeout', '20000000',
-                '-fflags', '+genpts+ignidx+discardcorrupt',
+                '-fflags', '+genpts+discardcorrupt',
                 '-err_detect', 'ignore_err',
                 '-user_agent', UA_NAVEGADOR,
                 '-probesize', '2M',
                 '-analyzeduration', '2000000',
-                ...(HILOS ? ['-threads', HILOS, '-filter_complex_threads', HILOS] : []),
                 '-thread_queue_size', '512',
                 '-re',
                 '-i', urlFinal,
-                // Si el logo no está en el servidor, se usa un cuadro transparente para que el canal salga igual (sin logo)
-                ...(LOGO_PATH
-                    ? ['-i', LOGO_PATH]
-                    : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
+                '-map', '0:v:0',
+                '-map', '0:a?',
+                '-c:v', 'copy',
+                '-c:a', 'copy',
+                '-muxdelay', '0',
+                '-flush_packets', '1',
+                '-f', 'mpegts',
+                `udp://127.0.0.1:${HLS_PUENTE_PUERTO}?pkt_size=1316`
             ];
-
-            // Videos sin logo y sin banner (intros, publicidad, clasificación, "a continuación"):
-            // se escalan directo a 720p, sin pasar por el lienzo de 1080p (ahorra CPU).
-            const directo720 = !video.logo && !video.permiteBanner;
-
-            // Logo: tamaño desde LOGO_TAMANO; posición fija (LOGO_X, LOGO_Y)
-            let filterComplex = video.logo ?
-                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=${LOGO_TAMANO}:${LOGO_TAMANO}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${LOGO_Y}[v1];` :
-                (directo720
-                    ? `[0:v]fps=${FPS_SALIDA},scale=${sel.w}:${sel.h}:flags=${scaleFlags},setsar=1[v1];`
-                    : `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`);
-
-            let etiqueta = 'v1';
-
-            // Barra de noticias (azul, abajo): sube deslizando y el texto corre de derecha a izquierda.
-            // Va DEBAJO del banner del evento (el banner queda encima y no se mueve).
-            const ajN = datasetConfig.ajustes || AJUSTES_DEFECTO;
-            if (video.permiteBanner && ajN.cintilloActivo && String(ajN.cintilloTexto || '').trim() !== '') {
-                const velN = Math.max(40, numAjuste(ajN.cintilloVelocidad, 140));
-                const colorN = /^[0-9a-fA-F]{6}$/.test(String(ajN.cintilloColor || '')) ? ajN.cintilloColor : '0a50c8';
-                const fuenteN = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                filterComplex += `color=c=0x${colorN}:s=1920x70:r=${FPS_SALIDA}[barra];` +
-                                 `[${etiqueta}][barra]overlay=x=0:y='main_h-overlay_h*clip(t-1,0,1)':shortest=1[vn];` +
-                                 `[vn]drawtext=${fuenteN}textfile=${ARCHIVO_CINTILLO}:reload=1:expansion=none:enable='gte(t,2)':x='w-mod((t-2)*${velN},w+tw)':y=main_h-56:fontsize=38:fontcolor=white[vk];`;
-                etiqueta = 'vk';
-            }
-
-            // Cuenta regresiva del evento: solo en programación (episodios, retransmisiones y gist),
-            // nunca en publicidad, intros ni clasificación.
-            const estEv = video.permiteBanner ? verificarEstadoEvento() : null;
-            if (estEv && estEv.tipo === 'proximo') {
-                const aj = datasetConfig.ajustes || AJUSTES_DEFECTO;
-                const S = Math.max(0, numAjuste(aj.segundosAparecer, 10));       // segundos tras iniciar el video
-                const p = `clip(t-${S},0,1)`;                                    // Permanece fijo tras aparecer (no se oculta)
-                const desliza = (x0) => `'${x0}-900*(1-${p})'`;                  // animación de entrada desde la izquierda
-
-                const rutaBanner = imagenesEvento.banner.ruta && fs.existsSync(imagenesEvento.banner.ruta) ? imagenesEvento.banner.ruta : null;
-                const rutaPj = imagenesEvento.personaje.ruta && fs.existsSync(imagenesEvento.personaje.ruta) ? imagenesEvento.personaje.ruta : null;
-                
-                const xCard = rutaPj ? 330 : 50;
-                let idx = 2;
-
-                if (rutaBanner) {
-                    ffmpegArgs.push('-i', rutaBanner);
-                    // Banner más ancho (600) y bajado en Y
-                    filterComplex += `[${idx}:v]scale=600:-2[bnr];[${etiqueta}][bnr]overlay=x=${desliza(xCard)}:y=main_h-overlay_h-20[vb];`;
-                    etiqueta = 'vb';
-                    idx++;
-                }
-                if (rutaPj) {
-                    ffmpegArgs.push('-i', rutaPj);
-                    filterComplex += `[${idx}:v]scale=-2:360[pj];[${etiqueta}][pj]overlay=x=${desliza(30)}:y=main_h-overlay_h-50[vp];`;
-                    etiqueta = 'vp';
-                    idx++;
-                }
-                const fuente = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                // Texto de la cuenta regresiva movido un poco más hacia la derecha (xCard + 50)
-                filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
-                etiqueta = 'vt';
-            }
-
-            filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
-
-            ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
-            ffmpegArgs.push(
-                '-c:v', 'libx264', '-preset', presetX264, '-tune', 'zerolatency',
-                ...(HILOS ? ['-threads', HILOS] : []),
-                '-b:v', bitrateV, '-maxrate', maxrateV, '-bufsize', bufsizeV,
-                '-g', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-keyint_min', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-sc_threshold', '0',
-                '-c:a', 'aac', '-b:a', `${BITRATE_AUDIO}k`, '-ac', '2',
-                '-max_muxing_queue_size', '1024',
-                '-muxdelay', '0', '-flush_packets', '1',
-                '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
-            );
 
             await new Promise((resolve) => {
                 const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
