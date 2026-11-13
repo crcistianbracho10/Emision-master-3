@@ -1,5 +1,4 @@
 const { spawn } = require('child_process');
-const dgram = require('dgram');
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
@@ -29,16 +28,6 @@ const RTMP_URL = (process.env.RTMP_URL || "").trim();
 // El canal sale SOLO por RTMP (ya no se crean archivos HLS). El codificador manda la señal al puerto local 9999 y de ahí la toma el proceso RTMP.
 const RTMP_PUENTE_PUERTO = 9999;
 
-// Salida UDP secundaria (opcional): segunda copia de la señal (MPEG-TS, ffmpeg -c copy, sin recodificar) hacia otro servidor (DockHosting).
-// Se configura SOLO con la variable de entorno UDP_HLS_URL. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316
-// Si UDP_HLS_URL no está definida, nada de esto se activa y el canal funciona exactamente igual que antes (UDP local 127.0.0.1:9999).
-const UDP_HLS_URL = (process.env.UDP_HLS_URL || "").trim();
-// Dos procesos ffmpeg no pueden leer a la vez el mismo puerto UDP (el segundo falla con "Address already in use"),
-// así que, SOLO cuando UDP_HLS_URL está definida, un relé interno recibe 127.0.0.1:9999 (donde sigue escribiendo el codificador)
-// y reparte la señal: al RTMP (puerto 9998) y a la salida UDP secundaria (puerto 9997).
-const UDP_RELE_PUERTO_RTMP = 9998;
-const UDP_RELE_PUERTO_SECUNDARIO = 9997;
-
 const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/6e4a07d268460ea807abf28f77c3880e/raw";
 const FALLBACK_IMAGE = "https://www.dropbox.com/scl/fi/x9xpsosc6mlmn5rw8e2at/Copilot_20260224_002036.png?rlkey=340kgc42pa64ytajhzv0vl53b&st=qr7ly3ru&dl=1";
 const BANNER_EVENTO_DEFECTO = "https://ibb.co/KpGf6Zxp";
@@ -50,17 +39,11 @@ const ARCHIVO_CINTILLO = '/tmp/cintillo.txt';
 // crea hilos de más, que se estorban entre sí cuando el límite es de 1 núcleo). Se puede forzar con FFMPEG_THREADS.
 const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleosDisponibles())));
 
-// ---------------------------------------------------------------
-// Calidad de salida: SIEMPRE 720p (1280x720). No hay selector ni modo automático.
-// ---------------------------------------------------------------
-const PERFIL = { nombre: '720p', w: 1280, h: 720, kbps: 1000, preset: 'superfast' };
-const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil (1000)
 const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96); // kbps
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
 // Cada cuántos segundos hay un cuadro clave. Menos segundos = el reproductor arranca más rápido (sin irse tanto del vivo).
 const SEGUNDOS_CUADRO_CLAVE = 1.5;
 // Logo del canal: el tamaño se cambia con la variable de entorno LOGO_TAMANO (en píxeles).
-// La posición es FIJA (medida sobre el lienzo de 1080p; luego todo se reduce a 720p).
 const LOGO_TAMANO = Math.max(40, parseInt(process.env.LOGO_TAMANO, 10) || 245);
 const LOGO_X = 170; // fijo: distancia al borde
 const LOGO_Y = 75;  // fijo: distancia al borde de arriba
@@ -408,7 +391,6 @@ setInterval(sincronizarDataset, 60000);
 // ---------------------------------------------------------------
 let procesoRtmp = null;
 let reintentoRtmp = null;
-let puertoEntradaRtmp = RTMP_PUENTE_PUERTO; // por defecto el RTMP lee 127.0.0.1:9999; solo cambia si el relé UDP secundario está activo
 
 function ocultarClaveRtmp(texto) {
     // Nunca se escribe la clave en el registro (el panel y los logs pueden verse)
@@ -428,7 +410,7 @@ function iniciarRTMP() {
         '-fflags', '+nobuffer+genpts',
         '-probesize', '500000',
         '-analyzeduration', '500000',
-        '-i', `udp://127.0.0.1:${puertoEntradaRtmp}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
+        '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
         '-c:v', 'copy',
         '-c:a', 'copy',
         '-bsf:a', 'aac_adtstoasc',
@@ -476,178 +458,6 @@ function iniciarRTMP() {
             reintentoRtmp = setTimeout(iniciarRTMP, 5000);
         }
     });
-}
-
-
-// ---------------------------------------------------------------
-// Salida UDP secundaria: copia de la señal hacia DockHosting (solo si existe UDP_HLS_URL). No toca la salida UDP local 127.0.0.1:9999.
-// ---------------------------------------------------------------
-let udpDestino = '';                          // URL final validada (nunca se escribe completa en el registro)
-let udpDestinoHost = '';                      // host:puerto, solo para mostrar en el registro
-let procesoUdp = null;                        // proceso ffmpeg secundario (uno solo)
-let reintentoUdp = null;                      // temporizador de reintento (uno solo)
-let releUdp = null;                           // socket del relé interno
-let reintentoRele = null;
-let udpSecundarioActivo = false;              // true cuando el relé está listo y se permite lanzar el ffmpeg secundario
-let udpSecundarioPreparado = false;           // evita preparar/iniciar todo más de una vez
-let releUdpPaquetes = 0;
-let releUdpErroresEnvio = 0;
-let releUdpUltimoAviso = 0;
-
-function ocultarDestinoUdp(texto) {
-    // El destino público no se escribe completo en el registro (el panel y los logs pueden verse)
-    return udpDestino ? String(texto).split(udpDestino).join('udp://***') : String(texto);
-}
-
-// Valida UDP_HLS_URL: debe ser udp://HOST:PUERTO. Si falta pkt_size se añade pkt_size=1316.
-function validarUdpHlsUrl() {
-    if (!UDP_HLS_URL) return false;
-    let u;
-    try { u = new URL(UDP_HLS_URL); } catch (e) {
-        console.log('⛔ [UDP] UDP_HLS_URL no es una URL válida. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316. La salida UDP secundaria queda desactivada; el canal sigue con su UDP local.');
-        return false;
-    }
-    if (u.protocol !== 'udp:' || !u.hostname || !u.port) {
-        console.log('⛔ [UDP] UDP_HLS_URL debe empezar con udp:// y llevar host y puerto. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316. La salida UDP secundaria queda desactivada; el canal sigue con su UDP local.');
-        return false;
-    }
-    let destino = UDP_HLS_URL;
-    if (!/[?&]pkt_size=/i.test(destino)) {
-        destino += (destino.includes('?') ? '&' : '?') + 'pkt_size=1316';
-        console.log('ℹ️ [UDP] UDP_HLS_URL no traía pkt_size: se usa pkt_size=1316.');
-    }
-    udpDestino = destino;
-    udpDestinoHost = `${u.hostname}:${u.port}`;
-    return true;
-}
-
-// Relé interno: recibe lo que el codificador escribe en 127.0.0.1:9999 y lo reparte (copia exacta de cada paquete).
-function iniciarReleUdp() {
-    return new Promise((resolve) => {
-        if (releUdp) return resolve(true); // ya está iniciado: no se duplica
-        let resuelto = false;
-        let sock;
-        try {
-            sock = dgram.createSocket({ type: 'udp4', recvBufferSize: 8 * 1024 * 1024 });
-        } catch (e) {
-            console.log(`⛔ [UDP] No se pudo crear el relé UDP: ${e.message}`);
-            return resolve(false);
-        }
-        sock.on('error', (err) => {
-            console.log(`⚠️ [UDP] Error en el relé local: ${err.message}`);
-            try { sock.close(); } catch (e) {}
-            if (!resuelto) { resuelto = true; return resolve(false); }
-            // Error con el relé ya activo: se reabre solo en 3s (una sola vez a la vez)
-            if (releUdp === sock) releUdp = null;
-            if (!reintentoRele) {
-                reintentoRele = setTimeout(() => { reintentoRele = null; iniciarReleUdp(); }, 3000);
-            }
-        });
-        sock.on('message', (msg) => {
-            if (releUdpPaquetes === 0) console.log('✅ [UDP] El relé local recibe la señal del codificador (127.0.0.1:' + RTMP_PUENTE_PUERTO + ').');
-            releUdpPaquetes++;
-            const alEnviar = (err) => {
-                if (!err) return;
-                releUdpErroresEnvio++;
-                if (Date.now() - releUdpUltimoAviso > 60000) {
-                    releUdpUltimoAviso = Date.now();
-                    console.log(`⚠️ [UDP] Error al repartir paquetes en el relé local: ${err.message} (${releUdpErroresEnvio} en total)`);
-                }
-            };
-            if (RTMP_URL) sock.send(msg, UDP_RELE_PUERTO_RTMP, '127.0.0.1', alEnviar);
-            sock.send(msg, UDP_RELE_PUERTO_SECUNDARIO, '127.0.0.1', alEnviar);
-        });
-        sock.bind(RTMP_PUENTE_PUERTO, '127.0.0.1', () => {
-            releUdp = sock;
-            if (!resuelto) { resuelto = true; resolve(true); }
-        });
-    });
-}
-
-// Prepara todo (una sola vez): valida la URL, abre el relé y, si todo salió bien, hace que el RTMP lea del relé.
-// Si algo falla, el canal queda igual que antes: el RTMP lee directo de 127.0.0.1:9999 y no hay envío secundario.
-async function prepararSalidaUdpSecundaria() {
-    if (!UDP_HLS_URL) {
-        console.log('ℹ️ [UDP] UDP_HLS_URL no está definida: no hay salida UDP secundaria (el canal sigue normal con su UDP local).');
-        return;
-    }
-    if (udpSecundarioPreparado) return;
-    udpSecundarioPreparado = true;
-    if (!validarUdpHlsUrl()) return;
-    const ok = await iniciarReleUdp();
-    if (!ok) {
-        console.log(`⛔ [UDP] No se pudo abrir el relé en 127.0.0.1:${RTMP_PUENTE_PUERTO}. La salida UDP secundaria queda desactivada; el canal sigue normal con su UDP local.`);
-        return;
-    }
-    puertoEntradaRtmp = UDP_RELE_PUERTO_RTMP; // el RTMP pasa a leer del relé (misma señal, sin recodificar)
-    udpSecundarioActivo = true;
-    console.log(`📡 [UDP] Salida UDP secundaria activada hacia ${udpDestinoHost} (-c copy, sin recodificar).`);
-}
-
-function iniciarUdpSecundario() {
-    if (!udpSecundarioActivo || !udpDestino) return;
-    if (procesoUdp) return; // ya hay uno en marcha: nunca se lanza un segundo
-    if (reintentoUdp) { clearTimeout(reintentoUdp); reintentoUdp = null; }
-    console.log(`📡 [UDP] Iniciando envío UDP secundario hacia ${udpDestinoHost} ...`);
-    let proc;
-    try {
-        proc = spawn('ffmpeg', [
-            '-hide_banner', '-nostdin',
-            '-fflags', '+nobuffer+genpts',
-            '-probesize', '500000',
-            '-analyzeduration', '500000',
-            '-i', `udp://127.0.0.1:${UDP_RELE_PUERTO_SECUNDARIO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
-            '-c', 'copy',
-            '-flush_packets', '1',
-            '-f', 'mpegts',
-            udpDestino
-        ]);
-    } catch (e) {
-        console.log(`⛔ [UDP] No se pudo lanzar ffmpeg para el envío UDP secundario: ${e.message}. Reintento en 5s...`);
-        reintentoUdp = setTimeout(() => { reintentoUdp = null; iniciarUdpSecundario(); }, 5000);
-        return;
-    }
-    procesoUdp = proc;
-    let enviando = false;
-    let lineasMostradas = 0;
-    let ultimoEstado = 0;
-    let cerrado = false;
-    const avisoSinSenal = setTimeout(() => {
-        if (!enviando) console.log('⏳ [UDP] Pasaron 40s y no se ha enviado nada por UDP: o el codificador aún no arranca (revisa los logs de arriba) o el destino no responde.');
-    }, 40000);
-    const alCerrar = (motivo) => {
-        if (cerrado) return;
-        cerrado = true;
-        clearTimeout(avisoSinSenal);
-        if (procesoUdp === proc) procesoUdp = null;
-        console.log(`⚠️ [UDP] El envío UDP secundario se detuvo (${motivo}). Reintentando en 5s...`);
-        if (!reintentoUdp) reintentoUdp = setTimeout(() => { reintentoUdp = null; iniciarUdpSecundario(); }, 5000);
-    };
-    proc.stderr.on('data', (data) => {
-        const msg = data.toString().trim();
-        if (!msg) return;
-        if (msg.includes('frame=') || msg.includes('size=')) {
-            if (!enviando) {
-                enviando = true;
-                console.log(`✅ [UDP] Envío UDP secundario ACTIVO hacia ${udpDestinoHost}.`);
-            }
-            if (Date.now() - ultimoEstado > 60000) {
-                ultimoEstado = Date.now();
-                console.log(`📊 [UDP] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)} · paquetes en el relé: ${releUdpPaquetes}`);
-            }
-            return;
-        }
-        if (/decode_slice_header|non-existing PPS|Last message repeated|co located POCs|mmco|reference picture missing|Packet corrupt|no frame/i.test(msg)) return;
-        if (lineasMostradas < 40 || /error|failed|refused|timed out|denied|Input\/output|invalid|not found|Connection|unreachable/i.test(msg)) {
-            lineasMostradas++;
-            console.log(`[UDP] ${ocultarDestinoUdp(msg).slice(0, 300)}`);
-        }
-    });
-    proc.on('error', (err) => {
-        console.log(`⛔ [UDP] Error del proceso ffmpeg del envío UDP secundario: ${err.message}`);
-        alCerrar('error al lanzar ffmpeg');
-    });
-    proc.on('close', (code, signal) => alCerrar(`código ${code}, señal ${signal}`));
 }
 
 
@@ -1119,7 +929,7 @@ function obtenerElementoActualEnEmision() {
                     logoDer: false,
                     permiteBanner: true,
                     desc: `${prog.nombre} (Parte 2 - ${indice2 + 1}/${total})`,
-                    alTerminar: () => { indicesProgramas[claveProg] = (indice2 + 1) % total; guardarEstadoPersistente(); }
+                    alTerminar: () => { indicesProgramas[claveProg] = (indice1 + 1) % total; guardarEstadoPersistente(); }
                 });
                 secuenciaBloque.slice(inicioGrupo).forEach(x => { x.grupo = 'parte2'; });
                 secuenciaBloque[inicioGrupo].inicioGrupo = true;
@@ -1240,10 +1050,8 @@ function forzarRecalculo() {
 
 async function motorCanalC() {
     await prepararLogo();
-    await prepararSalidaUdpSecundaria(); // opcional: solo hace algo si existe UDP_HLS_URL
     if (RTMP_URL) iniciarRTMP();
     else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
-    iniciarUdpSecundario(); // opcional: no hace nada si el envío UDP secundario no está activo
     await sincronizarDataset();
     while (true) {
         interrumpirBloque = false;
@@ -1317,23 +1125,31 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
-            // Posición horizontal del logo (LOGO_X fijo)
-            let xPos = video.logoDer ? `main_w-overlay_w-${LOGO_X}` : String(LOGO_X);
             const urlFinal = corregirUrl(video.url);
+            const ajActual = datasetConfig.ajustes || AJUSTES_DEFECTO;
 
-            // Modo de codificación (Ajustes → modoCodificacion): calidad = más CPU, ligero = menos CPU
-            const modoC = (datasetConfig.ajustes || AJUSTES_DEFECTO).modoCodificacion || 'equilibrado';
-            const scaleFlags = modoC === 'calidad' ? 'lanczos' : (modoC === 'ligero' ? 'fast_bilinear' : 'bilinear');
-            // La composición (logo, banner, barra) se hace en 1080p y al final se reduce SIEMPRE a 720p
-            const sel = PERFIL;
-            const kbpsV = BITRATE_VIDEO || sel.kbps;
-            const bitrateV = `${kbpsV}k`;
-            const maxrateV = `${Math.round(kbpsV * 1.5)}k`; // permite ráfagas: sale más rápido cuando hace falta
-            const bufsizeV = `${Math.round(kbpsV * 3)}k`; // búfer más grande: evita que el reproductor se quede cargando
-            const presetX264 = sel.preset;
-            console.log(`\n📺 AIRE: ${video.desc}`);
-            console.log(`⚙️ [CALIDAD] ${sel.nombre} fija | ${sel.w}x${sel.h} | video ${kbpsV}k + audio ${BITRATE_AUDIO}k | ${FPS_SALIDA} fps | cuadro clave cada ${SEGUNDOS_CUADRO_CLAVE}s | x264 ${presetX264} | hilos ${HILOS}`);
-            console.log(`🖼️ [LOGO] ${video.logo ? (LOGO_PATH ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
+            // ---------------------------------------------------------------
+            // Decisión: Copy directo sin recodificar vs. Filtros (Logo / Banner / Estiramiento 4:3 -> 16:9)
+            // ---------------------------------------------------------------
+            const estEv = video.permiteBanner ? verificarEstadoEvento() : null;
+            const tieneBannerEvento = !!(estEv && estEv.tipo === 'proximo');
+            const tieneCintillo = !!(video.permiteBanner && ajActual.cintilloActivo && String(ajActual.cintilloTexto || '').trim() !== '');
+            const tieneLogo = !!(video.logo && LOGO_PATH);
+
+            // Detectamos las dimensiones y si el video fuente es 4:3 (relación de aspecto menor a 1.5, ej: 640x480 = 1.33)
+            let esCuatroTercios = false;
+            let srcW = 0, srcH = 0;
+            const infoVid = await ffprobeInfo(urlFinal);
+            if (infoVid && infoVid.streams && infoVid.streams[0]) {
+                srcW = Number(infoVid.streams[0].width || 0);
+                srcH = Number(infoVid.streams[0].height || 0);
+                if (srcW > 0 && srcH > 0 && (srcW / srcH) < 1.5) {
+                    esCuatroTercios = true;
+                }
+            }
+
+            // Solo usamos -c:v copy puro cuando NO hay logo, NO hay cintillo, NO hay banner de evento y NO es 4:3
+            const usarCopyDirecto = !tieneLogo && !tieneCintillo && !tieneBannerEvento && !esCuatroTercios;
 
             let ffmpegArgs = [
                 '-reconnect', '1',
@@ -1348,86 +1164,102 @@ async function motorCanalC() {
                 ...(HILOS ? ['-threads', HILOS, '-filter_complex_threads', HILOS] : []),
                 '-thread_queue_size', '512',
                 '-re',
-                '-i', urlFinal,
-                // Si el logo no está en el servidor, se usa un cuadro transparente para que el canal salga igual (sin logo)
-                ...(LOGO_PATH
-                    ? ['-i', LOGO_PATH]
-                    : ['-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba'])
+                '-i', urlFinal
             ];
 
-            // Videos sin logo y sin banner (intros, publicidad, clasificación, "a continuación"):
-            // se escalan directo a 720p, sin pasar por el lienzo de 1080p (ahorra CPU).
-            const directo720 = !video.logo && !video.permiteBanner;
+            if (usarCopyDirecto) {
+                console.log(`\n📺 AIRE (COPY PURO SIN RECODIFICAR): ${video.desc}`);
+                ffmpegArgs.push(
+                    '-c:v', 'copy',
+                    '-c:a', 'aac', '-b:a', `${BITRATE_AUDIO}k`, '-ac', '2',
+                    '-max_muxing_queue_size', '1024',
+                    '-muxdelay', '0', '-flush_packets', '1',
+                    '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
+                );
+            } else {
+                // Posición horizontal del logo (LOGO_X fijo)
+                let xPos = video.logoDer ? `main_w-overlay_w-${LOGO_X}` : String(LOGO_X);
+                const modoC = ajActual.modoCodificacion || 'equilibrado';
+                const scaleFlags = modoC === 'calidad' ? 'lanczos' : (modoC === 'ligero' ? 'fast_bilinear' : 'bilinear');
+                const presetX264 = 'superfast';
 
-            // Logo: tamaño desde LOGO_TAMANO; posición fija (LOGO_X, LOGO_Y)
-            let filterComplex = video.logo ?
-                `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[bg];[1:v]scale=${LOGO_TAMANO}:${LOGO_TAMANO}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${LOGO_Y}[v1];` :
-                (directo720
-                    ? `[0:v]fps=${FPS_SALIDA},scale=${sel.w}:${sel.h}:flags=${scaleFlags},setsar=1[v1];`
-                    : `[0:v]fps=${FPS_SALIDA},scale=1920:1080:flags=${scaleFlags},setsar=1[v1];`);
+                console.log(`\n📺 AIRE (CON FILTROS${esCuatroTercios ? ' + ESTIRAMIENTO 4:3 -> 16:9' : ''}): ${video.desc}`);
+                console.log(`🖼️ [LOGO] ${video.logo ? (LOGO_PATH ? 'activo en este video' : 'este video lleva logo pero FALTA Canal_C.png en el servidor') : 'este video va sin logo (así está en la programación)'}`);
 
-            let etiqueta = 'v1';
-
-            // Barra de noticias (azul, abajo): sube deslizando y el texto corre de derecha a izquierda.
-            // Va DEBAJO del banner del evento (el banner queda encima y no se mueve).
-            const ajN = datasetConfig.ajustes || AJUSTES_DEFECTO;
-            if (video.permiteBanner && ajN.cintilloActivo && String(ajN.cintilloTexto || '').trim() !== '') {
-                const velN = Math.max(40, numAjuste(ajN.cintilloVelocidad, 140));
-                const colorN = /^[0-9a-fA-F]{6}$/.test(String(ajN.cintilloColor || '')) ? ajN.cintilloColor : '0a50c8';
-                const fuenteN = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                filterComplex += `color=c=0x${colorN}:s=1920x70:r=${FPS_SALIDA}[barra];` +
-                                 `[${etiqueta}][barra]overlay=x=0:y='main_h-overlay_h*clip(t-1,0,1)':shortest=1[vn];` +
-                                 `[vn]drawtext=${fuenteN}textfile=${ARCHIVO_CINTILLO}:reload=1:expansion=none:enable='gte(t,2)':x='w-mod((t-2)*${velN},w+tw)':y=main_h-56:fontsize=38:fontcolor=white[vk];`;
-                etiqueta = 'vk';
-            }
-
-            // Cuenta regresiva del evento: solo en programación (episodios, retransmisiones y gist),
-            // nunca en publicidad, intros ni clasificación.
-            const estEv = video.permiteBanner ? verificarEstadoEvento() : null;
-            if (estEv && estEv.tipo === 'proximo') {
-                const aj = datasetConfig.ajustes || AJUSTES_DEFECTO;
-                const S = Math.max(0, numAjuste(aj.segundosAparecer, 10));       // segundos tras iniciar el video
-                const p = `clip(t-${S},0,1)`;                                    // Permanece fijo tras aparecer (no se oculta)
-                const desliza = (x0) => `'${x0}-900*(1-${p})'`;                  // animación de entrada desde la izquierda
-
-                const rutaBanner = imagenesEvento.banner.ruta && fs.existsSync(imagenesEvento.banner.ruta) ? imagenesEvento.banner.ruta : null;
-                const rutaPj = imagenesEvento.personaje.ruta && fs.existsSync(imagenesEvento.personaje.ruta) ? imagenesEvento.personaje.ruta : null;
-                
-                const xCard = rutaPj ? 330 : 50;
-                let idx = 2;
-
-                if (rutaBanner) {
-                    ffmpegArgs.push('-i', rutaBanner);
-                    // Banner más ancho (600) y bajado en Y
-                    filterComplex += `[${idx}:v]scale=600:-2[bnr];[${etiqueta}][bnr]overlay=x=${desliza(xCard)}:y=main_h-overlay_h-20[vb];`;
-                    etiqueta = 'vb';
-                    idx++;
+                // Entrada 1: Logo o cuadro transparente
+                if (LOGO_PATH) {
+                    ffmpegArgs.push('-i', LOGO_PATH);
+                } else {
+                    ffmpegArgs.push('-f', 'lavfi', '-i', 'color=c=black@0.0:s=16x16:d=1,format=rgba');
                 }
-                if (rutaPj) {
-                    ffmpegArgs.push('-i', rutaPj);
-                    filterComplex += `[${idx}:v]scale=-2:360[pj];[${etiqueta}][pj]overlay=x=${desliza(30)}:y=main_h-overlay_h-50[vp];`;
-                    etiqueta = 'vp';
-                    idx++;
+
+                // Definimos la resolución de trabajo: si hay gráficos superpuestos grandes (como logo o banner) se usa el lienzo de 1080p, 
+                // de lo contrario se usa la resolución original del video fuente o 720p base para conservar su calidad original sin forzar 720p fijos.
+                const usaLienzoFullHD = tieneLogo || tieneBannerEvento || tieneCintillo;
+                const targetW = usaLienzoFullHD ? 1920 : (srcW > 0 ? srcW : 1280);
+                const targetH = usaLienzoFullHD ? 1080 : (srcH > 0 ? srcH : 720);
+
+                // Filtro para estirar 4:3 a horizontal (16:9) usando setdar=16/9 y setsar=1
+                let filterComplex = video.logo ?
+                    `[0:v]fps=${FPS_SALIDA},scale=${targetW}:${targetH}:flags=${scaleFlags},setsar=1,setdar=16/9[bg];[1:v]scale=${LOGO_TAMANO}:${LOGO_TAMANO}:force_original_aspect_ratio=decrease[logo];[bg][logo]overlay=${xPos}:${LOGO_Y}[v1];` :
+                    `[0:v]fps=${FPS_SALIDA},scale=${targetW}:${targetH}:flags=${scaleFlags},setsar=1,setdar=16/9[v1];`;
+
+                let etiqueta = 'v1';
+
+                // Barra de noticias (cintillo)
+                if (tieneCintillo) {
+                    const velN = Math.max(40, numAjuste(ajActual.cintilloVelocidad, 140));
+                    const colorN = /^[0-9a-fA-F]{6}$/.test(String(ajActual.cintilloColor || '')) ? ajActual.cintilloColor : '0a50c8';
+                    const fuenteN = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
+                    filterComplex += `color=c=0x${colorN}:s=${targetW}x70:r=${FPS_SALIDA}[barra];` +
+                                     `[${etiqueta}][barra]overlay=x=0:y='main_h-overlay_h*clip(t-1,0,1)':shortest=1[vn];` +
+                                     `[vn]drawtext=${fuenteN}textfile=${ARCHIVO_CINTILLO}:reload=1:expansion=none:enable='gte(t,2)':x='w-mod((t-2)*${velN},w+tw)':y=main_h-56:fontsize=38:fontcolor=white[vk];`;
+                    etiqueta = 'vk';
                 }
-                const fuente = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                // Texto de la cuenta regresiva movido un poco más hacia la derecha (xCard + 50)
-                filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
-                etiqueta = 'vt';
+
+                // Cuenta regresiva del evento
+                if (tieneBannerEvento) {
+                    const S = Math.max(0, numAjuste(ajActual.segundosAparecer, 10));
+                    const p = `clip(t-${S},0,1)`;
+                    const desliza = (x0) => `'${x0}-900*(1-${p})'`;
+
+                    const rutaBanner = imagenesEvento.banner.ruta && fs.existsSync(imagenesEvento.banner.ruta) ? imagenesEvento.banner.ruta : null;
+                    const rutaPj = imagenesEvento.personaje.ruta && fs.existsSync(imagenesEvento.personaje.ruta) ? imagenesEvento.personaje.ruta : null;
+                    
+                    const xCard = rutaPj ? 330 : 50;
+                    let idx = 2;
+
+                    if (rutaBanner) {
+                        ffmpegArgs.push('-i', rutaBanner);
+                        filterComplex += `[${idx}:v]scale=600:-2[bnr];[${etiqueta}][bnr]overlay=x=${desliza(xCard)}:y=main_h-overlay_h-20[vb];`;
+                        etiqueta = 'vb';
+                        idx++;
+                    }
+                    if (rutaPj) {
+                        ffmpegArgs.push('-i', rutaPj);
+                        filterComplex += `[${idx}:v]scale=-2:360[pj];[${etiqueta}][pj]overlay=x=${desliza(30)}:y=main_h-overlay_h-50[vp];`;
+                        etiqueta = 'vp';
+                        idx++;
+                    }
+                    const fuente = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
+                    filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
+                    etiqueta = 'vt';
+                }
+
+                filterComplex += `[${etiqueta}]format=yuv420p[v];[0:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
+
+                ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
+                ffmpegArgs.push(
+                    '-c:v', 'libx264', '-preset', presetX264, '-tune', 'zerolatency',
+                    ...(HILOS ? ['-threads', HILOS] : []),
+                    '-crf', '23', // Calidad dinámica basada en CRF en lugar de limitar a un bitrate fijo de 720p
+                    '-g', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-keyint_min', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-sc_threshold', '0',
+                    '-c:a', 'aac', '-b:a', `${BITRATE_AUDIO}k`, '-ac', '2',
+                    '-max_muxing_queue_size', '1024',
+                    '-muxdelay', '0', '-flush_packets', '1',
+                    '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
+                );
             }
-
-            filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
-
-            ffmpegArgs.push('-filter_complex', filterComplex, '-map', '[v]', '-map', '[a]');
-            ffmpegArgs.push(
-                '-c:v', 'libx264', '-preset', presetX264, '-tune', 'zerolatency',
-                ...(HILOS ? ['-threads', HILOS] : []),
-                '-b:v', bitrateV, '-maxrate', maxrateV, '-bufsize', bufsizeV,
-                '-g', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-keyint_min', String(Math.round(FPS_SALIDA * SEGUNDOS_CUADRO_CLAVE)), '-sc_threshold', '0',
-                '-c:a', 'aac', '-b:a', `${BITRATE_AUDIO}k`, '-ac', '2',
-                '-max_muxing_queue_size', '1024',
-                '-muxdelay', '0', '-flush_packets', '1',
-                '-f', 'mpegts', 'udp://127.0.0.1:9999?pkt_size=1316'
-            );
 
             await new Promise((resolve) => {
                 const ffmpegProc = spawn('ffmpeg', ffmpegArgs);
@@ -1447,15 +1279,12 @@ async function motorCanalC() {
                             ffmpegProc.kill('SIGKILL');
                         }
                     } else if (horaFinBloqueStr && itemActual.corteEstricto) {
-                        // Corte a la fuerza SOLO para himno y vivo (horario estricto).
-                        // Los programas NO se cortan a mitad de video.
                         const { horaStr, horaCompletaStr } = obtenerTiempoVenezuela();
                         if (horaCompletaStr >= horaFinBloqueStr || horaStr >= horaFinBloqueStr) {
                             console.log(`⏰ [LOG HORARIO] Límite alcanzado (${horaFinBloqueStr}). Cortando transmisión actual.`);
                             ffmpegProc.kill('SIGKILL');
                         }
                     } else if ((itemActual.tipo === 'programa_secuencia' || itemActual.tipo === 'gist') && ajusteHorarioActivo() && !itemActual.forzado) {
-                        // Si ya le toca a otro programa y a este video le falta más que la tolerancia, se corta
                         const ahoraProg = programaProgramadoAhora();
                         if (ahoraProg && ahoraProg.clave !== itemActual.claveSlot) {
                             const tol = numAjuste((datasetConfig.ajustes || AJUSTES_DEFECTO).toleranciaMinutos, 3) * 60;
@@ -1469,7 +1298,7 @@ async function motorCanalC() {
                     }
                 }, 5000);
 
-                const ultimasLineasFfmpeg = []; // últimas líneas de ffmpeg (sin progreso), para mostrar si falla
+                const ultimasLineasFfmpeg = [];
                 ffmpegProc.stderr.on('data', (data) => {
                     const msg = data.toString().trim();
                     if (!msg.includes("frame=")) {
@@ -1479,26 +1308,18 @@ async function motorCanalC() {
                     }
                     if (msg.includes("frame=")) {
                         ultimoFrame = Date.now();
-                        // Salud de la señal: velocidad de codificación (menos de 1x = el servidor no da abasto)
                         const sp = msg.match(/speed=\s*([\d.]+)x/g);
                         const fp = msg.match(/fps=\s*([\d.]+)/g);
                         if (sp) {
                             const v = parseFloat(sp[sp.length - 1].replace(/[^\d.]/g, ''));
                             if (!isNaN(v)) {
                                 salud.speed = v; salud.t = Date.now();
-                                if (v < 0.9 && Date.now() - inicioProcTs > 15000 && Date.now() - salud.ultimoAviso > 30000) {
-                                    salud.ultimoAviso = Date.now();
-                                    const carga = os.loadavg()[0].toFixed(1), nuc = os.cpus().length;
-                                    console.log(`⚠️ [SEÑAL] "${video.desc}" va a ${v}x (menos de 1x = se congela). Carga del servidor: ${carga} de ${nuc} núcleos. ` +
-                                        (os.loadavg()[0] < nuc * 0.7 ? 'El servidor no está saturado: el problema es ese video o su hosting (revísalo en el panel).' : 'El servidor está saturado: baja BITRATE_VIDEO (ej. 800) o FPS_SALIDA (ej. 20).'));
-                                }
-                                // Lentitud sostenida en un video que no es episodio: se corta y se salta por 1 hora
                                 if (v < 0.5 && Date.now() - inicioProcTs > 10000) {
                                     if (!lentoDesde) lentoDesde = Date.now();
                                     else if (Date.now() - lentoDesde > 15000 && puedeOmitirPorLento && !omitidoPorLento) {
                                         omitidoPorLento = true;
                                         lentos.set(urlFinal, Date.now());
-                                        console.log(`⛔ [SEÑAL] "${video.desc}" va a ${v}x desde hace más de 15 s: se omite y no se usará por 1 hora. Revisa ese video (resolución, fps, códec o hosting lento).`);
+                                        console.log(`⛔ [SEÑAL] "${video.desc}" va a ${v}x desde hace más de 15 s: se omite y no se usará por 1 hora.`);
                                         try { ffmpegProc.kill('SIGKILL'); } catch (e) {}
                                     }
                                 } else if (v >= 0.5) { lentoDesde = 0; }
@@ -1506,7 +1327,6 @@ async function motorCanalC() {
                         }
                         if (fp) salud.fps = parseFloat(fp[fp.length - 1].replace(/[^\d.]/g, ''));
                     }
-                    // Duración total y avance del video (para el ajuste de horario)
                     if (!duracionActual) {
                         const d = msg.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
                         if (d) duracionActual = Number(d[1]) * 3600 + Number(d[2]) * 60 + Number(d[3]);
@@ -1533,8 +1353,6 @@ async function motorCanalC() {
                     clearInterval(verificadorHoraFin);
                     clearInterval(watchdogCongelamiento);
                     if (procesoActual === ffmpegProc) procesoActual = null;
-                    // Si se reinicia el video a mano, no cuenta como terminado (no avanza el episodio)
-                    // Si se reinició a mano o se cortó por horario, el episodio no cuenta como emitido
                     if (!reinicioSolicitado && !cortePorHorario && typeof video.alTerminar === 'function') video.alTerminar();
                     resolve();
                 });
@@ -1542,7 +1360,7 @@ async function motorCanalC() {
 
             if (reinicioSolicitado) {
                 reinicioSolicitado = false;
-                i--; // repite el mismo video desde el inicio
+                i--;
             }
         }
         await new Promise(r => setTimeout(r, 500));
@@ -1550,7 +1368,6 @@ async function motorCanalC() {
 }
 
 // Proxy interno: permite que ffmpeg lea videos de tu dataset privado usando el token.
-// Solo acepta conexiones locales (del propio servidor), nadie de afuera puede usarlo.
 app.use('/_hf', async (req, res) => {
     const ip = (req.socket && req.socket.remoteAddress) || '';
     if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(ip)) return res.status(403).end();
@@ -1576,17 +1393,15 @@ app.use('/_hf', async (req, res) => {
     }
 });
 
-// Acepta un enlace completo (http...) o una ruta dentro de tu dataset (ej. videos/capitulo1.mp4)
 function normalizarEnlace(u) {
     if (typeof u !== 'string') return '';
     u = u.trim();
     if (!u) return '';
     if (/^https?:\/\//i.test(u)) return u;
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) return ''; // otro protocolo (ftp, etc.)
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) return '';
     return `https://huggingface.co/datasets/${DATASET_REPO_ID}/resolve/${DATASET_BRANCH}/${u.replace(/^\/+/, '').replace(/ /g, '%20')}`;
 }
 
-// Guarda en Hugging Face (si hay token) y deja copia local temporal
 async function persistirClave(clave) {
     const info = CLAVES_PANEL[clave];
     const datos = datasetConfig[clave];
@@ -1619,14 +1434,13 @@ const probarEnlaceVelocidad = async (enlace) => {
             try { r.data.destroy(); } catch (e) {}
         }
         const seg = Math.max(0.05, (Date.now() - inicio) / 1000);
-        const mbps = bytes >= 524288 ? Math.round((bytes * 8 / seg / 1e6) * 10) / 10 : null; // solo si hay muestra suficiente
+        const mbps = bytes >= 524288 ? Math.round((bytes * 8 / seg / 1e6) * 10) / 10 : null;
         return { ok: bueno, status: r.status, tipo, tamanoMB: total ? Math.round(total / 1048576) : null, mbps, deTuDataset: destino !== enlace && destino.indexOf('/_hf/') > -1 };
     } catch (e) {
         return { ok: false, status: 0, error: e.message };
     }
 };
 
-// ---- Revisión de formato de videos (para encontrar el que se pone lento) ----
 function ffprobeInfo(u) {
     return new Promise((resolve) => {
         const http = /^https?:/i.test(u);
@@ -1642,7 +1456,6 @@ function ffprobeInfo(u) {
     });
 }
 
-// ¿El índice (moov) del MP4 está al principio? (true = “fast start”, false = al final, null = no se pudo saber)
 async function detectarFaststart(destino) {
     try {
         const r = await axios.get(destino, { headers: { Range: 'bytes=0-4095', 'User-Agent': UA_NAVEGADOR }, responseType: 'arraybuffer', timeout: 15000, validateStatus: () => true });
