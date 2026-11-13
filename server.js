@@ -1,4 +1,5 @@
 const { spawn } = require('child_process');
+const dgram = require('dgram');
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
@@ -27,6 +28,16 @@ const HF_TOKEN = process.env.HF_TOKEN || "";
 const RTMP_URL = (process.env.RTMP_URL || "").trim();
 // El canal sale SOLO por RTMP (ya no se crean archivos HLS). El codificador manda la señal al puerto local 9999 y de ahí la toma el proceso RTMP.
 const RTMP_PUENTE_PUERTO = 9999;
+
+// Salida UDP secundaria (opcional): segunda copia de la señal (MPEG-TS, ffmpeg -c copy, sin recodificar) hacia otro servidor (DockHosting).
+// Se configura SOLO con la variable de entorno UDP_HLS_URL. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316
+// Si UDP_HLS_URL no está definida, nada de esto se activa y el canal funciona exactamente igual que antes (UDP local 127.0.0.1:9999).
+const UDP_HLS_URL = (process.env.UDP_HLS_URL || "").trim();
+// Dos procesos ffmpeg no pueden leer a la vez el mismo puerto UDP (el segundo falla con "Address already in use"),
+// así que, SOLO cuando UDP_HLS_URL está definida, un relé interno recibe 127.0.0.1:9999 (donde sigue escribiendo el codificador)
+// y reparte la señal: al RTMP (puerto 9998) y a la salida UDP secundaria (puerto 9997).
+const UDP_RELE_PUERTO_RTMP = 9998;
+const UDP_RELE_PUERTO_SECUNDARIO = 9997;
 
 const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/6e4a07d268460ea807abf28f77c3880e/raw";
 const FALLBACK_IMAGE = "https://www.dropbox.com/scl/fi/x9xpsosc6mlmn5rw8e2at/Copilot_20260224_002036.png?rlkey=340kgc42pa64ytajhzv0vl53b&st=qr7ly3ru&dl=1";
@@ -397,6 +408,7 @@ setInterval(sincronizarDataset, 60000);
 // ---------------------------------------------------------------
 let procesoRtmp = null;
 let reintentoRtmp = null;
+let puertoEntradaRtmp = RTMP_PUENTE_PUERTO; // por defecto el RTMP lee 127.0.0.1:9999; solo cambia si el relé UDP secundario está activo
 
 function ocultarClaveRtmp(texto) {
     // Nunca se escribe la clave en el registro (el panel y los logs pueden verse)
@@ -416,7 +428,7 @@ function iniciarRTMP() {
         '-fflags', '+nobuffer+genpts',
         '-probesize', '500000',
         '-analyzeduration', '500000',
-        '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
+        '-i', `udp://127.0.0.1:${puertoEntradaRtmp}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
         '-c:v', 'copy',
         '-c:a', 'copy',
         '-bsf:a', 'aac_adtstoasc',
@@ -464,6 +476,178 @@ function iniciarRTMP() {
             reintentoRtmp = setTimeout(iniciarRTMP, 5000);
         }
     });
+}
+
+
+// ---------------------------------------------------------------
+// Salida UDP secundaria: copia de la señal hacia DockHosting (solo si existe UDP_HLS_URL). No toca la salida UDP local 127.0.0.1:9999.
+// ---------------------------------------------------------------
+let udpDestino = '';                          // URL final validada (nunca se escribe completa en el registro)
+let udpDestinoHost = '';                      // host:puerto, solo para mostrar en el registro
+let procesoUdp = null;                        // proceso ffmpeg secundario (uno solo)
+let reintentoUdp = null;                      // temporizador de reintento (uno solo)
+let releUdp = null;                           // socket del relé interno
+let reintentoRele = null;
+let udpSecundarioActivo = false;              // true cuando el relé está listo y se permite lanzar el ffmpeg secundario
+let udpSecundarioPreparado = false;           // evita preparar/iniciar todo más de una vez
+let releUdpPaquetes = 0;
+let releUdpErroresEnvio = 0;
+let releUdpUltimoAviso = 0;
+
+function ocultarDestinoUdp(texto) {
+    // El destino público no se escribe completo en el registro (el panel y los logs pueden verse)
+    return udpDestino ? String(texto).split(udpDestino).join('udp://***') : String(texto);
+}
+
+// Valida UDP_HLS_URL: debe ser udp://HOST:PUERTO. Si falta pkt_size se añade pkt_size=1316.
+function validarUdpHlsUrl() {
+    if (!UDP_HLS_URL) return false;
+    let u;
+    try { u = new URL(UDP_HLS_URL); } catch (e) {
+        console.log('⛔ [UDP] UDP_HLS_URL no es una URL válida. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316. La salida UDP secundaria queda desactivada; el canal sigue con su UDP local.');
+        return false;
+    }
+    if (u.protocol !== 'udp:' || !u.hostname || !u.port) {
+        console.log('⛔ [UDP] UDP_HLS_URL debe empezar con udp:// y llevar host y puerto. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316. La salida UDP secundaria queda desactivada; el canal sigue con su UDP local.');
+        return false;
+    }
+    let destino = UDP_HLS_URL;
+    if (!/[?&]pkt_size=/i.test(destino)) {
+        destino += (destino.includes('?') ? '&' : '?') + 'pkt_size=1316';
+        console.log('ℹ️ [UDP] UDP_HLS_URL no traía pkt_size: se usa pkt_size=1316.');
+    }
+    udpDestino = destino;
+    udpDestinoHost = `${u.hostname}:${u.port}`;
+    return true;
+}
+
+// Relé interno: recibe lo que el codificador escribe en 127.0.0.1:9999 y lo reparte (copia exacta de cada paquete).
+function iniciarReleUdp() {
+    return new Promise((resolve) => {
+        if (releUdp) return resolve(true); // ya está iniciado: no se duplica
+        let resuelto = false;
+        let sock;
+        try {
+            sock = dgram.createSocket({ type: 'udp4', recvBufferSize: 8 * 1024 * 1024 });
+        } catch (e) {
+            console.log(`⛔ [UDP] No se pudo crear el relé UDP: ${e.message}`);
+            return resolve(false);
+        }
+        sock.on('error', (err) => {
+            console.log(`⚠️ [UDP] Error en el relé local: ${err.message}`);
+            try { sock.close(); } catch (e) {}
+            if (!resuelto) { resuelto = true; return resolve(false); }
+            // Error con el relé ya activo: se reabre solo en 3s (una sola vez a la vez)
+            if (releUdp === sock) releUdp = null;
+            if (!reintentoRele) {
+                reintentoRele = setTimeout(() => { reintentoRele = null; iniciarReleUdp(); }, 3000);
+            }
+        });
+        sock.on('message', (msg) => {
+            if (releUdpPaquetes === 0) console.log('✅ [UDP] El relé local recibe la señal del codificador (127.0.0.1:' + RTMP_PUENTE_PUERTO + ').');
+            releUdpPaquetes++;
+            const alEnviar = (err) => {
+                if (!err) return;
+                releUdpErroresEnvio++;
+                if (Date.now() - releUdpUltimoAviso > 60000) {
+                    releUdpUltimoAviso = Date.now();
+                    console.log(`⚠️ [UDP] Error al repartir paquetes en el relé local: ${err.message} (${releUdpErroresEnvio} en total)`);
+                }
+            };
+            if (RTMP_URL) sock.send(msg, UDP_RELE_PUERTO_RTMP, '127.0.0.1', alEnviar);
+            sock.send(msg, UDP_RELE_PUERTO_SECUNDARIO, '127.0.0.1', alEnviar);
+        });
+        sock.bind(RTMP_PUENTE_PUERTO, '127.0.0.1', () => {
+            releUdp = sock;
+            if (!resuelto) { resuelto = true; resolve(true); }
+        });
+    });
+}
+
+// Prepara todo (una sola vez): valida la URL, abre el relé y, si todo salió bien, hace que el RTMP lea del relé.
+// Si algo falla, el canal queda igual que antes: el RTMP lee directo de 127.0.0.1:9999 y no hay envío secundario.
+async function prepararSalidaUdpSecundaria() {
+    if (!UDP_HLS_URL) {
+        console.log('ℹ️ [UDP] UDP_HLS_URL no está definida: no hay salida UDP secundaria (el canal sigue normal con su UDP local).');
+        return;
+    }
+    if (udpSecundarioPreparado) return;
+    udpSecundarioPreparado = true;
+    if (!validarUdpHlsUrl()) return;
+    const ok = await iniciarReleUdp();
+    if (!ok) {
+        console.log(`⛔ [UDP] No se pudo abrir el relé en 127.0.0.1:${RTMP_PUENTE_PUERTO}. La salida UDP secundaria queda desactivada; el canal sigue normal con su UDP local.`);
+        return;
+    }
+    puertoEntradaRtmp = UDP_RELE_PUERTO_RTMP; // el RTMP pasa a leer del relé (misma señal, sin recodificar)
+    udpSecundarioActivo = true;
+    console.log(`📡 [UDP] Salida UDP secundaria activada hacia ${udpDestinoHost} (-c copy, sin recodificar).`);
+}
+
+function iniciarUdpSecundario() {
+    if (!udpSecundarioActivo || !udpDestino) return;
+    if (procesoUdp) return; // ya hay uno en marcha: nunca se lanza un segundo
+    if (reintentoUdp) { clearTimeout(reintentoUdp); reintentoUdp = null; }
+    console.log(`📡 [UDP] Iniciando envío UDP secundario hacia ${udpDestinoHost} ...`);
+    let proc;
+    try {
+        proc = spawn('ffmpeg', [
+            '-hide_banner', '-nostdin',
+            '-fflags', '+nobuffer+genpts',
+            '-probesize', '500000',
+            '-analyzeduration', '500000',
+            '-i', `udp://127.0.0.1:${UDP_RELE_PUERTO_SECUNDARIO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
+            '-c', 'copy',
+            '-flush_packets', '1',
+            '-f', 'mpegts',
+            udpDestino
+        ]);
+    } catch (e) {
+        console.log(`⛔ [UDP] No se pudo lanzar ffmpeg para el envío UDP secundario: ${e.message}. Reintento en 5s...`);
+        reintentoUdp = setTimeout(() => { reintentoUdp = null; iniciarUdpSecundario(); }, 5000);
+        return;
+    }
+    procesoUdp = proc;
+    let enviando = false;
+    let lineasMostradas = 0;
+    let ultimoEstado = 0;
+    let cerrado = false;
+    const avisoSinSenal = setTimeout(() => {
+        if (!enviando) console.log('⏳ [UDP] Pasaron 40s y no se ha enviado nada por UDP: o el codificador aún no arranca (revisa los logs de arriba) o el destino no responde.');
+    }, 40000);
+    const alCerrar = (motivo) => {
+        if (cerrado) return;
+        cerrado = true;
+        clearTimeout(avisoSinSenal);
+        if (procesoUdp === proc) procesoUdp = null;
+        console.log(`⚠️ [UDP] El envío UDP secundario se detuvo (${motivo}). Reintentando en 5s...`);
+        if (!reintentoUdp) reintentoUdp = setTimeout(() => { reintentoUdp = null; iniciarUdpSecundario(); }, 5000);
+    };
+    proc.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (!msg) return;
+        if (msg.includes('frame=') || msg.includes('size=')) {
+            if (!enviando) {
+                enviando = true;
+                console.log(`✅ [UDP] Envío UDP secundario ACTIVO hacia ${udpDestinoHost}.`);
+            }
+            if (Date.now() - ultimoEstado > 60000) {
+                ultimoEstado = Date.now();
+                console.log(`📊 [UDP] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)} · paquetes en el relé: ${releUdpPaquetes}`);
+            }
+            return;
+        }
+        if (/decode_slice_header|non-existing PPS|Last message repeated|co located POCs|mmco|reference picture missing|Packet corrupt|no frame/i.test(msg)) return;
+        if (lineasMostradas < 40 || /error|failed|refused|timed out|denied|Input\/output|invalid|not found|Connection|unreachable/i.test(msg)) {
+            lineasMostradas++;
+            console.log(`[UDP] ${ocultarDestinoUdp(msg).slice(0, 300)}`);
+        }
+    });
+    proc.on('error', (err) => {
+        console.log(`⛔ [UDP] Error del proceso ffmpeg del envío UDP secundario: ${err.message}`);
+        alCerrar('error al lanzar ffmpeg');
+    });
+    proc.on('close', (code, signal) => alCerrar(`código ${code}, señal ${signal}`));
 }
 
 
@@ -1056,8 +1240,10 @@ function forzarRecalculo() {
 
 async function motorCanalC() {
     await prepararLogo();
+    await prepararSalidaUdpSecundaria(); // opcional: solo hace algo si existe UDP_HLS_URL
     if (RTMP_URL) iniciarRTMP();
     else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
+    iniciarUdpSecundario(); // opcional: no hace nada si el envío UDP secundario no está activo
     await sincronizarDataset();
     while (true) {
         interrumpirBloque = false;
