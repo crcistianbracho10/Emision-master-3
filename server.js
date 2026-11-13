@@ -531,9 +531,11 @@ function iniciarHLS() {
             '-map', '0:v:0', '-map', '0:a?',
             '-c:v', 'copy', '-c:a', 'copy',
             '-f', 'hls',
-            '-hls_time', '4',
-            '-hls_list_size', '8',
-            '-hls_flags', 'delete_segments+append_list+omit_endlist',
+            // Segmentos cortos para reducir la latencia de reproducción.
+            // En modo stream-copy el corte real también depende de los keyframes de la fuente.
+            '-hls_time', '2',
+            '-hls_list_size', '6',
+            '-hls_flags', 'delete_segments+append_list+omit_endlist+temp_file',
             '-hls_segment_filename', path.join(HLS_DIR, 'segment_%06d.ts'),
             HLS_PLAYLIST
         ]);
