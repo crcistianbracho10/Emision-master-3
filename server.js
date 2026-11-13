@@ -5,6 +5,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
+const dgram = require('dgram');
 
 // Registro en memoria (se muestra en el panel)
 const logBuffer = [];
@@ -22,10 +23,15 @@ const port = process.env.PORT || 8080; // blitz.cloud lee el puerto declarado en
 const DATASET_REPO_ID = process.env.DATASET_REPO_ID || "cristianbracho904/programacion-tv";
 const DATASET_BRANCH = process.env.DATASET_BRANCH || "main";
 const HF_TOKEN = process.env.HF_TOKEN || "";
-// Salida HLS local: no requiere RTMP ni una página web. Express publica el .m3u8 y sus segmentos.
+// Salidas simultáneas: RTMP (como antes) y HLS para la señal secundaria.
+// La URL RTMP y su clave se configuran únicamente en la variable de entorno RTMP_URL.
+const RTMP_URL = (process.env.RTMP_URL || '').trim();
 const HLS_DIR = process.env.HLS_DIR || '/tmp/canalc-hls';
 const HLS_PLAYLIST = path.join(HLS_DIR, 'live.m3u8');
-const HLS_PUENTE_PUERTO = 9999;
+// Un único puente UDP recibe el MPEG-TS y lo duplica a dos puertos locales independientes.
+const PUENTE_ENTRADA_PUERTO = 9999;
+const HLS_PUENTE_PUERTO = 10000;
+const RTMP_PUENTE_PUERTO = 10001;
 fs.mkdirSync(HLS_DIR, { recursive: true });
 
 const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/6e4a07d268460ea807abf28f77c3880e/raw";
@@ -420,6 +426,90 @@ async function sincronizarDataset() {
 setInterval(sincronizarDataset, 60000);
 
 // ---------------------------------------------------------------
+// Puente UDP: duplica cada paquete de entrada para que HLS y RTMP
+// reciban la señal completa sin competir por el mismo puerto UDP.
+// ---------------------------------------------------------------
+let socketPuente = null;
+function iniciarPuenteUDP() {
+    if (socketPuente) return;
+    socketPuente = dgram.createSocket('udp4');
+    socketPuente.on('message', (msg) => {
+        socketPuente.send(msg, HLS_PUENTE_PUERTO, '127.0.0.1');
+        if (RTMP_URL) socketPuente.send(msg, RTMP_PUENTE_PUERTO, '127.0.0.1');
+    });
+    socketPuente.on('error', (err) => console.log(`[UDP] Error en el puente: ${err.message}`));
+    socketPuente.bind(PUENTE_ENTRADA_PUERTO, '127.0.0.1', () => {
+        console.log(`[UDP] Puente activo ${PUENTE_ENTRADA_PUERTO} → HLS ${HLS_PUENTE_PUERTO}${RTMP_URL ? ` + RTMP ${RTMP_PUENTE_PUERTO}` : ''}`);
+    });
+}
+
+// ---------------------------------------------------------------
+// Salida RTMP: publica la misma señal del canal, sin recodificar.
+// La clave nunca se imprime en los registros.
+// ---------------------------------------------------------------
+let procesoRtmp = null;
+let reintentoRtmp = null;
+function ocultarClaveRtmp(texto) {
+    return RTMP_URL ? String(texto).split(RTMP_URL).join('rtmp://***') : String(texto);
+}
+function iniciarRTMP() {
+    if (!RTMP_URL) return;
+    if (reintentoRtmp) { clearTimeout(reintentoRtmp); reintentoRtmp = null; }
+    if (procesoRtmp) {
+        try { procesoRtmp.removeAllListeners('close'); procesoRtmp.kill('SIGKILL'); } catch (e) {}
+    }
+    let hostRtmp = '';
+    try { hostRtmp = new URL(RTMP_URL).host; } catch (e) { hostRtmp = '(RTMP_URL no es válida)'; }
+    console.log(`📡 [RTMP] Conectando salida RTMP a ${hostRtmp} ...`);
+    const proc = spawn('ffmpeg', [
+        '-hide_banner', '-loglevel', 'warning',
+        '-fflags', '+genpts+discardcorrupt',
+        '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
+        '-map', '0:v:0', '-map', '0:a?',
+        '-c:v', 'copy', '-c:a', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        '-flush_packets', '1',
+        '-f', 'flv',
+        RTMP_URL
+    ]);
+    procesoRtmp = proc;
+    let conectado = false, yaPublicando = false, lineasMostradas = 0, ultimoEstado = 0;
+    const avisoSinSenal = setTimeout(() => {
+        if (!conectado) console.log('⏳ [RTMP] Aún no llegan cuadros al servidor RTMP; revisa la señal de entrada y la variable RTMP_URL.');
+    }, 40000);
+    proc.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (!msg) return;
+        if (/Already publishing/i.test(msg)) yaPublicando = true;
+        if (msg.includes('frame=')) {
+            if (!conectado) { conectado = true; console.log('✅ [RTMP] Transmitiendo al servidor RTMP.'); }
+            if (Date.now() - ultimoEstado > 60000) {
+                ultimoEstado = Date.now();
+                console.log(`📊 [RTMP] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)}`);
+            }
+            return;
+        }
+        if (/decode_slice_header|non-existing PPS|Last message repeated|co located POCs|mmco|reference picture missing|Packet corrupt|no frame/i.test(msg)) return;
+        if (lineasMostradas < 40 || /error|failed|refused|timed out|denied|unauthorized|Input\/output|invalid|not found|Connection/i.test(msg)) {
+            lineasMostradas++;
+            console.log(`[RTMP] ${ocultarClaveRtmp(msg).slice(0, 300)}`);
+        }
+    });
+    proc.on('error', e => console.log(`[RTMP] No se pudo iniciar FFmpeg: ${e.message}`));
+    proc.on('close', (code, signal) => {
+        clearTimeout(avisoSinSenal);
+        if (procesoRtmp === proc) procesoRtmp = null;
+        if (yaPublicando) {
+            console.log('⛔ [RTMP] El servidor indica "Already publishing"; reintento en 20 s.');
+            reintentoRtmp = setTimeout(iniciarRTMP, 20000);
+        } else {
+            console.log(`⚠️ [RTMP] Salida cerrada (código ${code}, señal ${signal}). Reintentando en 5 s...`);
+            reintentoRtmp = setTimeout(iniciarRTMP, 5000);
+        }
+    });
+}
+
+// ---------------------------------------------------------------
 // Salida HLS: toma el flujo MPEG-TS local y crea /hls/live.m3u8.
 // Este proceso permanece abierto entre los videos de la programación.
 // ---------------------------------------------------------------
@@ -437,7 +527,7 @@ function iniciarHLS() {
         const proc = spawn('ffmpeg', [
             '-hide_banner', '-loglevel', 'warning',
             '-fflags', '+genpts+discardcorrupt',
-            '-i', `udp://127.0.0.1:${HLS_PUENTE_PUERTO}?fifo_size=1000000&overrun_nonfatal=1`,
+            '-i', `udp://127.0.0.1:${HLS_PUENTE_PUERTO}?fifo_size=1000000&overrun_nonfatal=1&buffer_size=8000000`,
             '-map', '0:v:0', '-map', '0:a?',
             '-c:v', 'copy', '-c:a', 'copy',
             '-f', 'hls',
@@ -971,7 +1061,10 @@ function forzarRecalculo() {
 }
 
 async function motorCanalC() {
+    iniciarPuenteUDP();
     iniciarHLS();
+    if (RTMP_URL) iniciarRTMP();
+    else console.log('⚠️ [RTMP] RTMP_URL no está configurada; se mantiene activa la salida HLS.');
     await sincronizarDataset();
     while (true) {
         interrumpirBloque = false;
@@ -1070,7 +1163,7 @@ async function motorCanalC() {
                 '-muxdelay', '0',
                 '-flush_packets', '1',
                 '-f', 'mpegts',
-                `udp://127.0.0.1:${HLS_PUENTE_PUERTO}?pkt_size=1316`
+                `udp://127.0.0.1:${PUENTE_ENTRADA_PUERTO}?pkt_size=1316`
             ];
 
             await new Promise((resolve) => {
