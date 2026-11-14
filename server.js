@@ -35,6 +35,8 @@ const BANNER_RESPALDO_DEFECTO = "https://i.postimg.cc/v8vXL9BV/images-(1)-(1).pn
 const ARCHIVO_ESTADO_PERSISTENTE = '/tmp/estado_episodios.json';
 const ARCHIVO_CUENTA = '/tmp/cuenta_regresiva.txt';
 const ARCHIVO_CINTILLO = '/tmp/cintillo.txt';
+const ARCHIVO_AVISO_ACTUAL = '/tmp/aviso_programa_actual.txt';
+const ARCHIVO_AVISO_SIGUIENTE = '/tmp/aviso_programa_siguiente.txt';
 // Hilos de ffmpeg: por defecto, tantos como núcleos REALES tiene el contenedor (ffmpeg ve los de la máquina entera y
 // crea hilos de más, que se estorban entre sí cuando el límite es de 1 núcleo). Se puede forzar con FFMPEG_THREADS.
 const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleosDisponibles())));
@@ -150,7 +152,8 @@ let programaForzado = null;        // índice (en programacion) del programa ini
 const lentos = new Map();          // videos que fueron demasiado lentos: url -> momento (se saltan 1 hora)
 let revision = { estado: 'ninguna', clave: '', total: 0, hechos: 0, filas: [] }; // revisión de formato de videos
 let salud = { speed: null, fps: null, t: 0, ultimoAviso: 0 }; // velocidad de codificación del servidor
-let slotCompletado = "";          // programa cuyo horario ya no admite más episodios (se rellena hasta que termine)
+let slotCompletado = "";          // programa cuyo horario ya no admite más episodios (se rellena hasta que termine
+let estadoAvisosPrograma = { clave: '', segundosAcumulados: 0 }; // tiempo de contenido acumulado del programa, no por video)
 
 function cargarEstadoPersistente() {
     try {
@@ -1236,6 +1239,17 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
+            // Avisos de continuidad: el reloj empieza en el primer video del programa,
+            // se conserva al cambiar de episodio/video y se reinicia al entrar otro programa.
+            let segundosDesdeInicioPrograma = null;
+            if (itemActual.tipo === 'programa_secuencia' && video.permiteBanner && itemActual.claveSlot) {
+                if (estadoAvisosPrograma.clave !== itemActual.claveSlot) {
+                    estadoAvisosPrograma = { clave: itemActual.claveSlot, segundosAcumulados: 0 };
+                    console.log(`📺 [AVISOS] Contador iniciado para "${estadoActualTransmision.programaActual}". Avisos una sola vez al minuto 3.`);
+                }
+                segundosDesdeInicioPrograma = Math.max(0, estadoAvisosPrograma.segundosAcumulados);
+            }
+
             // Posición horizontal del logo (LOGO_X fijo)
             let xPos = video.logoDer ? `main_w-overlay_w-${LOGO_X}` : String(LOGO_X);
             const urlFinal = corregirUrl(video.url);
@@ -1332,6 +1346,31 @@ async function motorCanalC() {
                 // Texto de la cuenta regresiva movido un poco más hacia la derecha (xCard + 50)
                 filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
                 etiqueta = 'vt';
+            }
+
+            // Avisos de continuidad arriba a la derecha:
+            // minuto 3-3:05 "ESTÁS VIENDO", 3:05-3:10 "A CONTINUACIÓN".
+            // El tiempo se calcula por programa completo, no se reinicia entre videos.
+            if (segundosDesdeInicioPrograma !== null) {
+                const actualHasta = 185 - segundosDesdeInicioPrograma;
+                const siguienteHasta = 190 - segundosDesdeInicioPrograma;
+                const fuenteAviso = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
+                const nombreActual = String(estadoActualTransmision.programaActual || 'Canal C').replace(/[\\r\\n]+/g, ' ').trim();
+                const nombreSiguiente = String(estadoActualTransmision.aContinuacion || 'Próximamente').replace(/[\\r\\n]+/g, ' ').trim();
+
+                if (actualHasta > 0) {
+                    const actualDesde = Math.max(0, 180 - segundosDesdeInicioPrograma);
+                    fs.writeFileSync(ARCHIVO_AVISO_ACTUAL, `ESTÁS VIENDO: ${nombreActual}`, 'utf8');
+                    filterComplex += `[${etiqueta}]drawtext=${fuenteAviso}textfile=${ARCHIVO_AVISO_ACTUAL}:expansion=none:enable='between(t,${actualDesde.toFixed(3)},${actualHasta.toFixed(3)})':x='w-tw-35':y=35:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=12[vav];`;
+                    etiqueta = 'vav';
+                }
+
+                if (siguienteHasta > 0) {
+                    const siguienteDesde = Math.max(0, 185 - segundosDesdeInicioPrograma);
+                    fs.writeFileSync(ARCHIVO_AVISO_SIGUIENTE, `A CONTINUACIÓN: ${nombreSiguiente}`, 'utf8');
+                    filterComplex += `[${etiqueta}]drawtext=${fuenteAviso}textfile=${ARCHIVO_AVISO_SIGUIENTE}:expansion=none:enable='between(t,${siguienteDesde.toFixed(3)},${siguienteHasta.toFixed(3)})':x='w-tw-35':y=35:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=12[vac];`;
+                    etiqueta = 'vac';
+                }
             }
 
             filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
@@ -1454,6 +1493,10 @@ async function motorCanalC() {
                     if (procesoActual === ffmpegProc) procesoActual = null;
                     // Si se reinicia el video a mano, no cuenta como terminado (no avanza el episodio)
                     // Si se reinició a mano o se cortó por horario, el episodio no cuenta como emitido
+                    if (itemActual.tipo === 'programa_secuencia' && video.permiteBanner &&
+                        estadoAvisosPrograma.clave === itemActual.claveSlot && tiempoActual > 0) {
+                        estadoAvisosPrograma.segundosAcumulados += tiempoActual;
+                    }
                     if (!reinicioSolicitado && !cortePorHorario && typeof video.alTerminar === 'function') video.alTerminar();
                     resolve();
                 });
