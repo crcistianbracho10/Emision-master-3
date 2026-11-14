@@ -307,23 +307,65 @@ app.get('/api/estado', (req, res) => {
     res.json(estadoActualTransmision);
 });
 
+// Diagnóstico público sin revelar credenciales: permite comprobar qué recibió Hugging Face.
+app.get('/api/diagnostico-dataset', (req, res) => {
+    res.json({
+        repositorio: DATASET_REPO_ID,
+        rama: DATASET_BRANCH,
+        tokenConfigurado: Boolean(HF_TOKEN),
+        ultimaSincronizacion: diagnosticoDataset.ultimaSincronizacion,
+        sincronizacionEnCurso: sincronizacionDatasetEnCurso,
+        archivos: diagnosticoDataset.archivos,
+        programasEnHorario: Array.isArray(datasetConfig.programacion) ? datasetConfig.programacion.length : 0,
+        listasDinamicas: Object.keys(listasProgramasPorArchivo),
+        programaEnAire: estadoActualTransmision.programaActual,
+        tituloEnAire: estadoActualTransmision.tituloActual
+    });
+});
+app.get('/api/logs', (req, res) => res.json({ logs: logBuffer.slice(-100) }));
+
 // ---------------------------------------------------------------
 // Dataset (Hugging Face) + cambios hechos desde el panel
 // ---------------------------------------------------------------
+const listasProgramasPorArchivo = Object.create(null);
+const diagnosticoDataset = { ultimaSincronizacion: null, archivos: {} };
+let ultimaFirmaProgramacion = '';
+let ultimoProgramaInformado = '';
+
 async function descargarArchivoDataset(nombreArchivo) {
+    const inicio = Date.now();
     try {
-        // Evita que una caché intermedia entregue una versión anterior del archivo.
-        const url = `https://huggingface.co/datasets/${DATASET_REPO_ID}/raw/${DATASET_BRANCH}/${nombreArchivo}?actualizado=${Date.now()}`;
+        const ruta = String(nombreArchivo || '').replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
+        const url = `https://huggingface.co/datasets/${DATASET_REPO_ID}/raw/${DATASET_BRANCH}/${ruta}?nocache=${Date.now()}`;
         const headers = {
             ...(HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {}),
             'Cache-Control': 'no-cache, no-store, max-age=0',
             'Pragma': 'no-cache'
         };
-        const response = await axios.get(url, { headers, timeout: 8000, maxRedirects: 5 });
-        return typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+        const response = await axios.get(url, { headers, timeout: 12000, maxRedirects: 5, validateStatus: () => true });
+        if (response.status < 200 || response.status >= 300) {
+            diagnosticoDataset.archivos[nombreArchivo] = { ok: false, status: response.status, ms: Date.now() - inicio, error: response.status === 401 || response.status === 403 ? 'Token sin permiso, inválido o dataset privado sin acceso' : `HTTP ${response.status}` };
+            console.log(`⚠️ [HF] ${nombreArchivo}: HTTP ${response.status}${response.status === 401 || response.status === 403 ? ' — revisa HF_TOKEN y permisos de lectura' : ''}`);
+            return null;
+        }
+        const datos = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+        diagnosticoDataset.archivos[nombreArchivo] = { ok: true, status: response.status, ms: Date.now() - inicio, elementos: Array.isArray(datos) ? datos.length : (datos && typeof datos === 'object' ? Object.keys(datos).length : 1) };
+        return datos;
     } catch (e) {
+        const status = e.response ? e.response.status : 0;
+        diagnosticoDataset.archivos[nombreArchivo] = { ok: false, status, ms: Date.now() - inicio, error: e.message };
+        console.log(`❌ [HF] Falló ${nombreArchivo}: ${status ? `HTTP ${status}` : e.code || e.message}${status === 401 || status === 403 ? ' — HF_TOKEN inválido o sin permiso de lectura' : ''}`);
         return null;
     }
+}
+
+function normalizarArchivoListaPrograma(valor) {
+    if (typeof valor !== 'string' || !valor.trim()) return null;
+    let ruta = valor.trim().replace(/\\/g, '/').replace(/^\/+/, '');
+    if (ruta.includes('..') || /^https?:\/\//i.test(ruta)) return null;
+    if (!ruta.includes('/')) ruta = `programas/${ruta}`;
+    if (!/\.[a-z0-9]+$/i.test(ruta)) ruta += '.txt';
+    return ruta;
 }
 
 function aplicarConfig(clave, valor) {
@@ -375,28 +417,24 @@ async function guardarEnHuggingFace(archivo, datos) {
 let sincronizacionDatasetEnCurso = false;
 
 async function sincronizarDataset() {
-    // Impide que una consulta lenta se solape con la siguiente actualización de 40 segundos.
-    if (sincronizacionDatasetEnCurso) return;
+    if (sincronizacionDatasetEnCurso) {
+        console.log('ℹ️ [DATASET] Se omitió una consulta: la sincronización anterior todavía está trabajando.');
+        return;
+    }
     sincronizacionDatasetEnCurso = true;
     const inicioSync = Date.now();
+    if (!HF_TOKEN) console.log('⚠️ [HF] HF_TOKEN no está configurado. Si el dataset es privado, Hugging Face rechazará las descargas. Usa un Access Token, no la contraseña de tu cuenta.');
     try {
         const entradas = Object.entries(CLAVES_PANEL);
-
-        // Descarga todos los archivos y la lista Gist al mismo tiempo.
         const [remotos, playlistGistRemota] = await Promise.all([
-            Promise.all(entradas.map(async ([clave, info]) => {
-                return [clave, await descargarArchivoDataset(info.archivo)];
-            })),
+            Promise.all(entradas.map(async ([clave, info]) => [clave, await descargarArchivoDataset(info.archivo)])),
             (async () => {
                 try {
-                    const separador = GIST_FALLBACK_URL.includes('?') ? '&' : '?';
-                    const gistRes = await axios.get(`${GIST_FALLBACK_URL}${separador}actualizado=${Date.now()}`, {
-                        timeout: 8000,
-                        headers: { 'Cache-Control': 'no-cache, no-store, max-age=0', 'Pragma': 'no-cache' }
-                    });
-                    return Array.isArray(gistRes.data) ? gistRes.data : JSON.parse(gistRes.data);
+                    const sep = GIST_FALLBACK_URL.includes('?') ? '&' : '?';
+                    const r = await axios.get(`${GIST_FALLBACK_URL}${sep}nocache=${Date.now()}`, { timeout: 12000, headers: { 'Cache-Control': 'no-cache' } });
+                    return Array.isArray(r.data) ? r.data : JSON.parse(r.data);
                 } catch (e) {
-                    console.log(`⚠️ [DATASET] No se pudo actualizar la lista Gist: ${e.response ? e.response.status : e.message}`);
+                    console.log(`⚠️ [GIST] No se pudo actualizar la lista: ${e.response ? `HTTP ${e.response.status}` : e.message}`);
                     return null;
                 }
             })()
@@ -409,28 +447,44 @@ async function sincronizarDataset() {
                 if (igual || (ov.hfOk && Date.now() - ov.t > 120000)) {
                     borrarOverride(clave);
                     if (remoto) aplicarConfig(clave, remoto);
-                } else {
-                    aplicarConfig(clave, ov.datos); // conserva cambios del panel aún pendientes de reflejarse en HF
-                }
-                continue;
+                } else aplicarConfig(clave, ov.datos);
+            } else if (remoto) aplicarConfig(clave, remoto);
+        }
+
+        // Descarga también cualquier lista de programa indicada en programacion.txt,
+        // aunque sea un programa nuevo que no existía cuando se escribió este servidor.
+        const archivosProgramas = [...new Set((datasetConfig.programacion || [])
+            .map(p => normalizarArchivoListaPrograma(p && p.archivo)).filter(Boolean))];
+        const dinamicos = await Promise.all(archivosProgramas.map(async ruta => [ruta, await descargarArchivoDataset(ruta)]));
+        for (const [ruta, datos] of dinamicos) {
+            if (Array.isArray(datos)) {
+                listasProgramasPorArchivo[ruta] = datos;
+            } else {
+                console.log(`⚠️ [PROGRAMAS] No se pudo cargar la lista indicada por programacion.txt: ${ruta}`);
             }
-            if (remoto) aplicarConfig(clave, remoto);
         }
 
         if (playlistGistRemota) datasetConfig.playlistGist = playlistGistRemota;
-
         await actualizarImagenesEvento();
+
         const disponibles = remotos.filter(([, datos]) => datos !== null).length;
-        console.log(`🔄 [DATASET] Sincronización terminada: ${disponibles}/${entradas.length} archivos de Hugging Face en ${((Date.now() - inicioSync) / 1000).toFixed(1)}s.`);
+        const firma = JSON.stringify(datasetConfig.programacion || []);
+        if (firma !== ultimaFirmaProgramacion) {
+            ultimaFirmaProgramacion = firma;
+            console.log(`🗓️ [PROGRAMACIÓN] Dataset actualizado: ${(datasetConfig.programacion || []).length} espacios. Listas vinculadas: ${archivosProgramas.join(', ') || 'ninguna'}.`);
+        }
+        diagnosticoDataset.ultimaSincronizacion = new Date().toISOString();
+        console.log(`🔄 [DATASET] Sincronización: ${disponibles}/${entradas.length} archivos base; ${dinamicos.filter(([, d]) => Array.isArray(d)).length}/${dinamicos.length} listas de programas; ${((Date.now() - inicioSync) / 1000).toFixed(1)}s.`);
     } catch (e) {
-        console.log(`⚠️ [DATASET] Error durante la sincronización: ${e.message}`);
+        console.log(`❌ [DATASET] Error general de sincronización: ${e.stack || e.message}`);
     } finally {
         sincronizacionDatasetEnCurso = false;
     }
 }
 
-// Revisa Hugging Face cada 40 segundos, sin acumular sincronizaciones simultáneas.
-setInterval(() => { sincronizarDataset(); }, 40000);
+// Primera lectura inmediata y luego actualización cada 40 segundos.
+setTimeout(() => sincronizarDataset(), 1000);
+setInterval(() => sincronizarDataset(), 40000);
 
 // ---------------------------------------------------------------
 // Salida RTMP: manda la misma señal del canal a un servidor externo (sin recodificar)
@@ -797,13 +851,16 @@ function programacionDeHoy() {
     return { dia: nombresDia[dia], total: todos.length, lista };
 }
 
-// Qué lista de episodios usa cada programa (según el campo "archivo" de programacion.txt)
-function claveListaDePrograma(prog) {
-    const n = prog && prog.archivo ? prog.archivo.toLowerCase() : "";
-    if (n.includes("magazine")) return 'magazine';
-    if (n.includes("secretos") || n.includes("prosperidad")) return 'secretosProsperidad';
-    if (n.includes("cartas") || n.includes("taron")) return 'cartasTaron';
-    return datasetConfig.magazine.length > 0 ? 'magazine' : 'cartasTaron';
+// Obtiene la lista de episodios vinculada al campo "archivo" de programacion.txt.
+// Admite archivos nuevos sin tener que agregarlos manualmente al código.
+function obtenerListaDePrograma(prog) {
+    const ruta = normalizarArchivoListaPrograma(prog && prog.archivo);
+    if (ruta && Array.isArray(listasProgramasPorArchivo[ruta])) return listasProgramasPorArchivo[ruta];
+    const n = String(prog && prog.archivo || '').toLowerCase();
+    if (n.includes('magazine')) return datasetConfig.magazine;
+    if (n.includes('secretos') || n.includes('prosperidad')) return datasetConfig.secretosProsperidad;
+    if (n.includes('cartas') || n.includes('taron')) return datasetConfig.cartasTaron;
+    return datasetConfig.magazine.length > 0 ? datasetConfig.magazine : datasetConfig.cartasTaron;
 }
 
 // Decide si hay que saltar el resto de la secuencia (solo ENTRE videos, nunca a mitad de uno)
@@ -891,14 +948,14 @@ function obtenerElementoActualEnEmision() {
 
     // Si ya no hay programa en horario (o es otro distinto), se libera la marca de "programa completado"
     if (slotCompletado) {
-        const aun = datasetConfig.programacion.some(p => p.dias.includes(diaSemana) && estaEnHorario(p.inicio, p.fin, horaStr) && `${p.nombre}|${p.inicio}` === slotCompletado);
+        const aun = datasetConfig.programacion.some(p => Array.isArray(p.dias) && p.dias.includes(diaSemana) && estaEnHorario(p.inicio, p.fin, horaStr) && `${p.nombre}|${p.inicio}` === slotCompletado);
         if (!aun) slotCompletado = "";
     }
 
     for (let i = 0; i < datasetConfig.programacion.length; i++) {
         let prog = datasetConfig.programacion[i];
         const esForzado = (programaForzado !== null && i === programaForzado);
-        if (programaForzado !== null ? esForzado : (prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr) && slotCompletado !== `${prog.nombre}|${prog.inicio}`)) {
+        if (programaForzado !== null ? esForzado : (Array.isArray(prog.dias) && prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr) && slotCompletado !== `${prog.nombre}|${prog.inicio}`)) {
             if (esForzado) { programaForzado = null; slotCompletado = ""; }
             let siguienteProg = datasetConfig.programacion[i + 1] ? datasetConfig.programacion[i + 1].nombre : "Transmisión Estelar / Gist";
             estadoActualTransmision.tituloActual = prog.nombre;
@@ -910,7 +967,15 @@ function obtenerElementoActualEnEmision() {
             let videoClasificacion = getVideoClasificacionPorHora(horaStr);
             const anuncios = getTodaPublicidad();
 
-            let listaPrograma = datasetConfig[claveListaDePrograma(prog)];
+            let listaPrograma = obtenerListaDePrograma(prog);
+            const idProgramaLog = `${prog.nombre}|${prog.archivo || '(sin archivo)'}|${Array.isArray(listaPrograma) ? listaPrograma.length : 0}`;
+            if (ultimoProgramaInformado !== idProgramaLog) {
+                ultimoProgramaInformado = idProgramaLog;
+                console.log(`📺 [PROGRAMACIÓN] Seleccionado: "${prog.nombre}" | archivo: ${prog.archivo || 'NO DEFINIDO'} | episodios cargados: ${Array.isArray(listaPrograma) ? listaPrograma.length : 0}.`);
+            }
+            if (!Array.isArray(listaPrograma) || listaPrograma.length === 0) {
+                console.log(`⚠️ [PROGRAMACIÓN] "${prog.nombre}" está en horario, pero su lista de videos está vacía. Revisa el campo archivo en programacion.txt y que ese archivo exista en el dataset.`);
+            }
 
             let claveProg = `${prog.nombre}-${prog.inicio}`;
             if (indicesProgramas[claveProg] === undefined) {
@@ -1040,7 +1105,7 @@ function programaProgramadoAhora() {
     const { horaStr } = obtenerTiempoVenezuela();
     const diaSemana = diaSemanaVenezuela();
     for (const prog of datasetConfig.programacion) {
-        if (prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr)) {
+        if (Array.isArray(prog.dias) && prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr)) {
             return { prog, clave: `${prog.nombre}|${prog.inicio}` };
         }
     }
@@ -1393,6 +1458,16 @@ async function motorCanalC() {
                     resolve();
                 });
             });
+
+            // Si Hugging Face cambió la parrilla mientras se emitía un video,
+            // recalcula el bloque al terminar este archivo; no espera a consumir toda la secuencia antigua.
+            if (!reinicioSolicitado && itemActual.tipo === 'programa_secuencia' && !itemActual.forzado) {
+                const programadoAhora = programaProgramadoAhora();
+                if (programadoAhora && programadoAhora.clave !== itemActual.claveSlot) {
+                    console.log(`🔁 [PROGRAMACIÓN] Cambio detectado al terminar el video. Sale "${itemActual.claveSlot}" y entra "${programadoAhora.prog.nombre}".`);
+                    break;
+                }
+            }
 
             if (reinicioSolicitado) {
                 reinicioSolicitado = false;
