@@ -145,6 +145,8 @@ let estadoActualTransmision = {
 let indicesProgramas = {};
 let ultimoHimnoReproducido = ""; // Control para evitar bucle infinito del himno
 let ultimoInicioProg = "";       // Evita repetir "A continuación" dentro del mismo programa
+const avisosProgramaMostrados = new Set(); // Un solo "ESTÁS VIENDO" por programa y horario
+const inicioContenidoPrograma = new Map(); // Momento en que comenzó el contenido real de cada programa
 let ultimoEventoPublicidad = ""; // Publicidad completa solo una vez antes de cada evento
 
 // Estado del control manual (panel)
@@ -1368,17 +1370,67 @@ async function motorCanalC() {
 
             let etiqueta = 'v1';
 
-            // Identificador superior discreto, como en la referencia visual:
-            // solo texto blanco, sin placa ni recuadro, alineado a la derecha.
-            // En el contenido del programa dice "ESTÁS VIENDO"; en el video
-            // promocional de inicio dice "A CONTINUACIÓN".
-            const esPromoContinuacion = /^a continuación:/i.test(String(video.desc || ''));
-            const esContenidoPrograma = itemActual.tipo === 'programa_secuencia' && video.logo && !esPromoContinuacion;
-            if (esContenidoPrograma || esPromoContinuacion) {
-                const fuenteEtiqueta = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                const textoEtiqueta = esPromoContinuacion ? 'A CONTINUACIÓN' : 'ESTÁS VIENDO';
-                filterComplex += `[${etiqueta}]drawtext=${fuenteEtiqueta}text='${textoEtiqueta}':x=w-tw-70:y=70:fontsize=42:fontcolor=white:shadowcolor=black@0.35:shadowx=1:shadowy=1[ve];`;
-                etiqueta = 've';
+            // "ESTÁS VIENDO": aparece una sola vez por programa durante 10 segundos.
+            // Se programa a los 3 minutos del contenido; si el bloque dura menos de 3:10,
+            // aparece en sus últimos 10 segundos. No se muestra en intros, anuncios ni promos.
+            let avisoProgramaPendiente = false;
+            let avisoProgramaUmbralVideo = 0;
+            const esContenidoPrograma = itemActual.tipo === 'programa_secuencia'
+                && video.logo
+                && /\(Parte [12] -/.test(String(video.desc || '')); // solo las partes reales del programa
+
+            if (esContenidoPrograma) {
+                const claveAviso = `${new Date().toLocaleDateString('en-CA', { timeZone: 'America/Caracas' })}|${itemActual.claveSlot || itemActual.programaActual || video.desc}`;
+                if (!inicioContenidoPrograma.has(claveAviso)) {
+                    inicioContenidoPrograma.set(claveAviso, Date.now());
+                }
+
+                const parseMinutos = (hora) => {
+                    const m = String(hora || '').match(/^(\\d{1,2}):(\\d{2})/);
+                    return m ? Number(m[1]) * 60 + Number(m[2]) : NaN;
+                };
+                const inicioMin = parseMinutos(itemActual.horaInicioBloque);
+                const finMin = parseMinutos(itemActual.horaFinBloque);
+                let duracionBloque = (Number.isFinite(inicioMin) && Number.isFinite(finMin))
+                    ? (finMin - inicioMin) * 60 : 0;
+                if (duracionBloque < 0) duracionBloque += 24 * 60 * 60;
+
+                const umbralAviso = duracionBloque > 0 && duracionBloque < 190
+                    ? Math.max(0, duracionBloque - 10)
+                    : 180;
+                const transcurrido = Math.max(0, (Date.now() - inicioContenidoPrograma.get(claveAviso)) / 1000);
+
+                if (!avisosProgramaMostrados.has(claveAviso)) {
+                    const demora = Math.max(0, umbralAviso - transcurrido);
+                    const fuenteEtiqueta = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
+                    // Los dos avisos salen juntos durante los mismos 10 segundos:
+                    // programa actual arriba y próximo programa debajo.
+                    const escaparTextoDrawtext = (valor) => String(valor || '')
+                        .replace(/\\/g, '\\\\')
+                        .replace(/:/g, '\\:')
+                        .replace(/'/g, "\\'")
+                        .replace(/%/g, '\\%');
+                    const programaActualAviso = escaparTextoDrawtext(
+                        estadoActualTransmision.programaActual || estadoActualTransmision.tituloActual || 'Programa actual'
+                    );
+                    const proximoProgramaAviso = escaparTextoDrawtext(
+                        estadoActualTransmision.aContinuacion || 'Programación en espera'
+                    );
+                    const habilitarAviso = `enable='between(t,${demora.toFixed(2)},${(demora + 10).toFixed(2)})'`;
+                    filterComplex += `[${etiqueta}]drawtext=${fuenteEtiqueta}text='ESTÁS VIENDO: ${programaActualAviso}':x=w-tw-70:y=70:fontsize=38:fontcolor=white:shadowcolor=black@0.45:shadowx=1:shadowy=1:${habilitarAviso}[av1];`;
+                    filterComplex += `[av1]drawtext=${fuenteEtiqueta}text='A CONTINUACIÓN: ${proximoProgramaAviso}':x=w-tw-70:y=118:fontsize=34:fontcolor=white:shadowcolor=black@0.45:shadowx=1:shadowy=1:${habilitarAviso}[ve];`;
+                    etiqueta = 've';
+
+                    if (demora <= 0) {
+                        // Ya pasaron los 3 minutos: este archivo inicia el aviso ahora.
+                        avisosProgramaMostrados.add(claveAviso);
+                    } else {
+                        // Si este archivo termina antes del momento previsto, el siguiente
+                        // video del mismo programa volverá a calcular cuánto falta.
+                        avisoProgramaPendiente = true;
+                        avisoProgramaUmbralVideo = demora;
+                    }
+                }
             }
 
             // Barra de noticias (azul, abajo): sube deslizando y el texto corre de derecha a izquierda.
@@ -1539,6 +1591,10 @@ async function motorCanalC() {
                 }, 5000);
 
                 ffmpegProc.on('close', (code) => {
+                    if (avisoProgramaPendiente && tiempoActual >= avisoProgramaUmbralVideo) {
+                        const claveAviso = `${new Date().toLocaleDateString('en-CA', { timeZone: 'America/Caracas' })}|${itemActual.claveSlot || itemActual.programaActual || video.desc}`;
+                        avisosProgramaMostrados.add(claveAviso);
+                    }
                     console.log(`ℹ️ [CIERRE] Finalizó el archivo: ${video.desc} (Código: ${code})`);
                     if (code !== 0 && code !== null) {
                         console.log(`❌ [FFMPEG] Error al emitir "${video.desc}". Últimas líneas de ffmpeg:\n   ` + ultimasLineasFfmpeg.join('\n   '));
