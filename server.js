@@ -1,5 +1,4 @@
 const { spawn } = require('child_process');
-const dgram = require('dgram');
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
@@ -29,16 +28,6 @@ const RTMP_URL = (process.env.RTMP_URL || "").trim();
 // El canal sale SOLO por RTMP (ya no se crean archivos HLS). El codificador manda la señal al puerto local 9999 y de ahí la toma el proceso RTMP.
 const RTMP_PUENTE_PUERTO = 9999;
 
-// Salida UDP secundaria (opcional): segunda copia de la señal (MPEG-TS, ffmpeg -c copy, sin recodificar) hacia otro servidor (DockHosting).
-// Se configura SOLO con la variable de entorno UDP_HLS_URL. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316
-// Si UDP_HLS_URL no está definida, nada de esto se activa y el canal funciona exactamente igual que antes (UDP local 127.0.0.1:9999).
-const UDP_HLS_URL = (process.env.UDP_HLS_URL || "").trim();
-// Dos procesos ffmpeg no pueden leer a la vez el mismo puerto UDP (el segundo falla con "Address already in use"),
-// así que, SOLO cuando UDP_HLS_URL está definida, un relé interno recibe 127.0.0.1:9999 (donde sigue escribiendo el codificador)
-// y reparte la señal: al RTMP (puerto 9998) y a la salida UDP secundaria (puerto 9997).
-const UDP_RELE_PUERTO_RTMP = 9998;
-const UDP_RELE_PUERTO_SECUNDARIO = 9997;
-
 const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/6e4a07d268460ea807abf28f77c3880e/raw";
 const FALLBACK_IMAGE = "https://www.dropbox.com/scl/fi/x9xpsosc6mlmn5rw8e2at/Copilot_20260224_002036.png?rlkey=340kgc42pa64ytajhzv0vl53b&st=qr7ly3ru&dl=1";
 const BANNER_EVENTO_DEFECTO = "https://ibb.co/KpGf6Zxp";
@@ -46,6 +35,8 @@ const BANNER_RESPALDO_DEFECTO = "https://i.postimg.cc/v8vXL9BV/images-(1)-(1).pn
 const ARCHIVO_ESTADO_PERSISTENTE = '/tmp/estado_episodios.json';
 const ARCHIVO_CUENTA = '/tmp/cuenta_regresiva.txt';
 const ARCHIVO_CINTILLO = '/tmp/cintillo.txt';
+const ARCHIVO_AVISO_ACTUAL = '/tmp/aviso_programa_actual.txt';
+const ARCHIVO_AVISO_SIGUIENTE = '/tmp/aviso_programa_siguiente.txt';
 // Hilos de ffmpeg: por defecto, tantos como núcleos REALES tiene el contenedor (ffmpeg ve los de la máquina entera y
 // crea hilos de más, que se estorban entre sí cuando el límite es de 1 núcleo). Se puede forzar con FFMPEG_THREADS.
 const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleosDisponibles())));
@@ -53,7 +44,7 @@ const HILOS = process.env.FFMPEG_THREADS || String(Math.max(1, Math.round(nucleo
 // ---------------------------------------------------------------
 // Calidad de salida: SIEMPRE 720p (1280x720). No hay selector ni modo automático.
 // ---------------------------------------------------------------
-const PERFIL = { nombre: '720p', w: 1280, h: 720, kbps: 1000, preset: 'superfast' };
+const PERFIL = { nombre: '720p', w: 1280, h: 720, kbps: 1000, preset: 'ultrafast' };
 const BITRATE_VIDEO = Math.max(0, parseInt(process.env.BITRATE_VIDEO, 10) || 0); // kbps; 0 = el del perfil (1000)
 const BITRATE_AUDIO = Math.max(32, parseInt(process.env.BITRATE_AUDIO, 10) || 96); // kbps
 const FPS_SALIDA = Math.min(30, Math.max(10, parseInt(process.env.FPS_SALIDA, 10) || 24));
@@ -145,8 +136,6 @@ let estadoActualTransmision = {
 let indicesProgramas = {};
 let ultimoHimnoReproducido = ""; // Control para evitar bucle infinito del himno
 let ultimoInicioProg = "";       // Evita repetir "A continuación" dentro del mismo programa
-const avisosProgramaMostrados = new Set(); // Un solo "ESTÁS VIENDO" por programa y horario
-const inicioContenidoPrograma = new Map(); // Momento en que comenzó el contenido real de cada programa
 let ultimoEventoPublicidad = ""; // Publicidad completa solo una vez antes de cada evento
 
 // Estado del control manual (panel)
@@ -163,7 +152,8 @@ let programaForzado = null;        // índice (en programacion) del programa ini
 const lentos = new Map();          // videos que fueron demasiado lentos: url -> momento (se saltan 1 hora)
 let revision = { estado: 'ninguna', clave: '', total: 0, hechos: 0, filas: [] }; // revisión de formato de videos
 let salud = { speed: null, fps: null, t: 0, ultimoAviso: 0 }; // velocidad de codificación del servidor
-let slotCompletado = "";          // programa cuyo horario ya no admite más episodios (se rellena hasta que termine)
+let slotCompletado = "";          // programa cuyo horario ya no admite más episodios (se rellena hasta que termine
+let estadoAvisosPrograma = { clave: '', segundosAcumulados: 0 }; // tiempo de contenido acumulado del programa, no por video)
 
 function cargarEstadoPersistente() {
     try {
@@ -320,18 +310,65 @@ app.get('/api/estado', (req, res) => {
     res.json(estadoActualTransmision);
 });
 
+// Diagnóstico público sin revelar credenciales: permite comprobar qué recibió Hugging Face.
+app.get('/api/diagnostico-dataset', (req, res) => {
+    res.json({
+        repositorio: DATASET_REPO_ID,
+        rama: DATASET_BRANCH,
+        tokenConfigurado: Boolean(HF_TOKEN),
+        ultimaSincronizacion: diagnosticoDataset.ultimaSincronizacion,
+        sincronizacionEnCurso: sincronizacionDatasetEnCurso,
+        archivos: diagnosticoDataset.archivos,
+        programasEnHorario: Array.isArray(datasetConfig.programacion) ? datasetConfig.programacion.length : 0,
+        listasDinamicas: Object.keys(listasProgramasPorArchivo),
+        programaEnAire: estadoActualTransmision.programaActual,
+        tituloEnAire: estadoActualTransmision.tituloActual
+    });
+});
+app.get('/api/logs', (req, res) => res.json({ logs: logBuffer.slice(-100) }));
+
 // ---------------------------------------------------------------
 // Dataset (Hugging Face) + cambios hechos desde el panel
 // ---------------------------------------------------------------
+const listasProgramasPorArchivo = Object.create(null);
+const diagnosticoDataset = { ultimaSincronizacion: null, archivos: {} };
+let ultimaFirmaProgramacion = '';
+let ultimoProgramaInformado = '';
+
 async function descargarArchivoDataset(nombreArchivo) {
+    const inicio = Date.now();
     try {
-        const url = `https://huggingface.co/datasets/${DATASET_REPO_ID}/raw/${DATASET_BRANCH}/${nombreArchivo}`;
-        const headers = HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {};
-        const response = await axios.get(url, { headers, timeout: 10000 });
-        return typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+        const ruta = String(nombreArchivo || '').replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/');
+        const url = `https://huggingface.co/datasets/${DATASET_REPO_ID}/raw/${DATASET_BRANCH}/${ruta}?nocache=${Date.now()}`;
+        const headers = {
+            ...(HF_TOKEN ? { Authorization: `Bearer ${HF_TOKEN}` } : {}),
+            'Cache-Control': 'no-cache, no-store, max-age=0',
+            'Pragma': 'no-cache'
+        };
+        const response = await axios.get(url, { headers, timeout: 12000, maxRedirects: 5, validateStatus: () => true });
+        if (response.status < 200 || response.status >= 300) {
+            diagnosticoDataset.archivos[nombreArchivo] = { ok: false, status: response.status, ms: Date.now() - inicio, error: response.status === 401 || response.status === 403 ? 'Token sin permiso, inválido o dataset privado sin acceso' : `HTTP ${response.status}` };
+            console.log(`⚠️ [HF] ${nombreArchivo}: HTTP ${response.status}${response.status === 401 || response.status === 403 ? ' — revisa HF_TOKEN y permisos de lectura' : ''}`);
+            return null;
+        }
+        const datos = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+        diagnosticoDataset.archivos[nombreArchivo] = { ok: true, status: response.status, ms: Date.now() - inicio, elementos: Array.isArray(datos) ? datos.length : (datos && typeof datos === 'object' ? Object.keys(datos).length : 1) };
+        return datos;
     } catch (e) {
+        const status = e.response ? e.response.status : 0;
+        diagnosticoDataset.archivos[nombreArchivo] = { ok: false, status, ms: Date.now() - inicio, error: e.message };
+        console.log(`❌ [HF] Falló ${nombreArchivo}: ${status ? `HTTP ${status}` : e.code || e.message}${status === 401 || status === 403 ? ' — HF_TOKEN inválido o sin permiso de lectura' : ''}`);
         return null;
     }
+}
+
+function normalizarArchivoListaPrograma(valor) {
+    if (typeof valor !== 'string' || !valor.trim()) return null;
+    let ruta = valor.trim().replace(/\\/g, '/').replace(/^\/+/, '');
+    if (ruta.includes('..') || /^https?:\/\//i.test(ruta)) return null;
+    if (!ruta.includes('/')) ruta = `programas/${ruta}`;
+    if (!/\.[a-z0-9]+$/i.test(ruta)) ruta += '.txt';
+    return ruta;
 }
 
 function aplicarConfig(clave, valor) {
@@ -380,37 +417,83 @@ async function guardarEnHuggingFace(archivo, datos) {
     }
 }
 
+let sincronizacionDatasetEnCurso = false;
+
 async function sincronizarDataset() {
-    for (const [clave, info] of Object.entries(CLAVES_PANEL)) {
-        const remoto = await descargarArchivoDataset(info.archivo);
-        const ov = leerOverride(clave);
-        if (ov) {
-            const igual = remoto && JSON.stringify(remoto) === JSON.stringify(ov.datos);
-            if (igual || (ov.hfOk && Date.now() - ov.t > 120000)) {
-                borrarOverride(clave);
-                if (remoto) aplicarConfig(clave, remoto);
-            } else {
-                aplicarConfig(clave, ov.datos); // cambio del panel aún pendiente de reflejarse en HF
-            }
-            continue;
-        }
-        if (remoto) aplicarConfig(clave, remoto);
+    if (sincronizacionDatasetEnCurso) {
+        console.log('ℹ️ [DATASET] Se omitió una consulta: la sincronización anterior todavía está trabajando.');
+        return;
     }
+    sincronizacionDatasetEnCurso = true;
+    const inicioSync = Date.now();
+    if (!HF_TOKEN) console.log('⚠️ [HF] HF_TOKEN no está configurado. Si el dataset es privado, Hugging Face rechazará las descargas. Usa un Access Token, no la contraseña de tu cuenta.');
     try {
-        const gistRes = await axios.get(GIST_FALLBACK_URL);
-        datasetConfig.playlistGist = Array.isArray(gistRes.data) ? gistRes.data : JSON.parse(gistRes.data);
-    } catch (e) {}
-    await actualizarImagenesEvento();
+        const entradas = Object.entries(CLAVES_PANEL);
+        const [remotos, playlistGistRemota] = await Promise.all([
+            Promise.all(entradas.map(async ([clave, info]) => [clave, await descargarArchivoDataset(info.archivo)])),
+            (async () => {
+                try {
+                    const sep = GIST_FALLBACK_URL.includes('?') ? '&' : '?';
+                    const r = await axios.get(`${GIST_FALLBACK_URL}${sep}nocache=${Date.now()}`, { timeout: 12000, headers: { 'Cache-Control': 'no-cache' } });
+                    return Array.isArray(r.data) ? r.data : JSON.parse(r.data);
+                } catch (e) {
+                    console.log(`⚠️ [GIST] No se pudo actualizar la lista: ${e.response ? `HTTP ${e.response.status}` : e.message}`);
+                    return null;
+                }
+            })()
+        ]);
+
+        for (const [clave, remoto] of remotos) {
+            const ov = leerOverride(clave);
+            if (ov) {
+                const igual = remoto && JSON.stringify(remoto) === JSON.stringify(ov.datos);
+                if (igual || (ov.hfOk && Date.now() - ov.t > 120000)) {
+                    borrarOverride(clave);
+                    if (remoto) aplicarConfig(clave, remoto);
+                } else aplicarConfig(clave, ov.datos);
+            } else if (remoto) aplicarConfig(clave, remoto);
+        }
+
+        // Descarga también cualquier lista de programa indicada en programacion.txt,
+        // aunque sea un programa nuevo que no existía cuando se escribió este servidor.
+        const archivosProgramas = [...new Set((datasetConfig.programacion || [])
+            .map(p => normalizarArchivoListaPrograma(p && p.archivo)).filter(Boolean))];
+        const dinamicos = await Promise.all(archivosProgramas.map(async ruta => [ruta, await descargarArchivoDataset(ruta)]));
+        for (const [ruta, datos] of dinamicos) {
+            if (Array.isArray(datos)) {
+                listasProgramasPorArchivo[ruta] = datos;
+            } else {
+                console.log(`⚠️ [PROGRAMAS] No se pudo cargar la lista indicada por programacion.txt: ${ruta}`);
+            }
+        }
+
+        if (playlistGistRemota) datasetConfig.playlistGist = playlistGistRemota;
+        await actualizarImagenesEvento();
+
+        const disponibles = remotos.filter(([, datos]) => datos !== null).length;
+        const firma = JSON.stringify(datasetConfig.programacion || []);
+        if (firma !== ultimaFirmaProgramacion) {
+            ultimaFirmaProgramacion = firma;
+            console.log(`🗓️ [PROGRAMACIÓN] Dataset actualizado: ${(datasetConfig.programacion || []).length} espacios. Listas vinculadas: ${archivosProgramas.join(', ') || 'ninguna'}.`);
+        }
+        diagnosticoDataset.ultimaSincronizacion = new Date().toISOString();
+        console.log(`🔄 [DATASET] Sincronización: ${disponibles}/${entradas.length} archivos base; ${dinamicos.filter(([, d]) => Array.isArray(d)).length}/${dinamicos.length} listas de programas; ${((Date.now() - inicioSync) / 1000).toFixed(1)}s.`);
+    } catch (e) {
+        console.log(`❌ [DATASET] Error general de sincronización: ${e.stack || e.message}`);
+    } finally {
+        sincronizacionDatasetEnCurso = false;
+    }
 }
 
-setInterval(sincronizarDataset, 60000);
+// Primera lectura inmediata y luego actualización cada 40 segundos.
+setTimeout(() => sincronizarDataset(), 1000);
+setInterval(() => sincronizarDataset(), 40000);
 
 // ---------------------------------------------------------------
 // Salida RTMP: manda la misma señal del canal a un servidor externo (sin recodificar)
 // ---------------------------------------------------------------
 let procesoRtmp = null;
 let reintentoRtmp = null;
-let puertoEntradaRtmp = RTMP_PUENTE_PUERTO; // por defecto el RTMP lee 127.0.0.1:9999; solo cambia si el relé UDP secundario está activo
 
 function ocultarClaveRtmp(texto) {
     // Nunca se escribe la clave en el registro (el panel y los logs pueden verse)
@@ -430,7 +513,7 @@ function iniciarRTMP() {
         '-fflags', '+nobuffer+genpts',
         '-probesize', '500000',
         '-analyzeduration', '500000',
-        '-i', `udp://127.0.0.1:${puertoEntradaRtmp}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
+        '-i', `udp://127.0.0.1:${RTMP_PUENTE_PUERTO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
         '-c:v', 'copy',
         '-c:a', 'copy',
         '-bsf:a', 'aac_adtstoasc',
@@ -478,178 +561,6 @@ function iniciarRTMP() {
             reintentoRtmp = setTimeout(iniciarRTMP, 5000);
         }
     });
-}
-
-
-// ---------------------------------------------------------------
-// Salida UDP secundaria: copia de la señal hacia DockHosting (solo si existe UDP_HLS_URL). No toca la salida UDP local 127.0.0.1:9999.
-// ---------------------------------------------------------------
-let udpDestino = '';                          // URL final validada (nunca se escribe completa en el registro)
-let udpDestinoHost = '';                      // host:puerto, solo para mostrar en el registro
-let procesoUdp = null;                        // proceso ffmpeg secundario (uno solo)
-let reintentoUdp = null;                      // temporizador de reintento (uno solo)
-let releUdp = null;                           // socket del relé interno
-let reintentoRele = null;
-let udpSecundarioActivo = false;              // true cuando el relé está listo y se permite lanzar el ffmpeg secundario
-let udpSecundarioPreparado = false;           // evita preparar/iniciar todo más de una vez
-let releUdpPaquetes = 0;
-let releUdpErroresEnvio = 0;
-let releUdpUltimoAviso = 0;
-
-function ocultarDestinoUdp(texto) {
-    // El destino público no se escribe completo en el registro (el panel y los logs pueden verse)
-    return udpDestino ? String(texto).split(udpDestino).join('udp://***') : String(texto);
-}
-
-// Valida UDP_HLS_URL: debe ser udp://HOST:PUERTO. Si falta pkt_size se añade pkt_size=1316.
-function validarUdpHlsUrl() {
-    if (!UDP_HLS_URL) return false;
-    let u;
-    try { u = new URL(UDP_HLS_URL); } catch (e) {
-        console.log('⛔ [UDP] UDP_HLS_URL no es una URL válida. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316. La salida UDP secundaria queda desactivada; el canal sigue con su UDP local.');
-        return false;
-    }
-    if (u.protocol !== 'udp:' || !u.hostname || !u.port) {
-        console.log('⛔ [UDP] UDP_HLS_URL debe empezar con udp:// y llevar host y puerto. Formato: udp://HOST_PUBLICO:8888?pkt_size=1316. La salida UDP secundaria queda desactivada; el canal sigue con su UDP local.');
-        return false;
-    }
-    let destino = UDP_HLS_URL;
-    if (!/[?&]pkt_size=/i.test(destino)) {
-        destino += (destino.includes('?') ? '&' : '?') + 'pkt_size=1316';
-        console.log('ℹ️ [UDP] UDP_HLS_URL no traía pkt_size: se usa pkt_size=1316.');
-    }
-    udpDestino = destino;
-    udpDestinoHost = `${u.hostname}:${u.port}`;
-    return true;
-}
-
-// Relé interno: recibe lo que el codificador escribe en 127.0.0.1:9999 y lo reparte (copia exacta de cada paquete).
-function iniciarReleUdp() {
-    return new Promise((resolve) => {
-        if (releUdp) return resolve(true); // ya está iniciado: no se duplica
-        let resuelto = false;
-        let sock;
-        try {
-            sock = dgram.createSocket({ type: 'udp4', recvBufferSize: 8 * 1024 * 1024 });
-        } catch (e) {
-            console.log(`⛔ [UDP] No se pudo crear el relé UDP: ${e.message}`);
-            return resolve(false);
-        }
-        sock.on('error', (err) => {
-            console.log(`⚠️ [UDP] Error en el relé local: ${err.message}`);
-            try { sock.close(); } catch (e) {}
-            if (!resuelto) { resuelto = true; return resolve(false); }
-            // Error con el relé ya activo: se reabre solo en 3s (una sola vez a la vez)
-            if (releUdp === sock) releUdp = null;
-            if (!reintentoRele) {
-                reintentoRele = setTimeout(() => { reintentoRele = null; iniciarReleUdp(); }, 3000);
-            }
-        });
-        sock.on('message', (msg) => {
-            if (releUdpPaquetes === 0) console.log('✅ [UDP] El relé local recibe la señal del codificador (127.0.0.1:' + RTMP_PUENTE_PUERTO + ').');
-            releUdpPaquetes++;
-            const alEnviar = (err) => {
-                if (!err) return;
-                releUdpErroresEnvio++;
-                if (Date.now() - releUdpUltimoAviso > 60000) {
-                    releUdpUltimoAviso = Date.now();
-                    console.log(`⚠️ [UDP] Error al repartir paquetes en el relé local: ${err.message} (${releUdpErroresEnvio} en total)`);
-                }
-            };
-            if (RTMP_URL) sock.send(msg, UDP_RELE_PUERTO_RTMP, '127.0.0.1', alEnviar);
-            sock.send(msg, UDP_RELE_PUERTO_SECUNDARIO, '127.0.0.1', alEnviar);
-        });
-        sock.bind(RTMP_PUENTE_PUERTO, '127.0.0.1', () => {
-            releUdp = sock;
-            if (!resuelto) { resuelto = true; resolve(true); }
-        });
-    });
-}
-
-// Prepara todo (una sola vez): valida la URL, abre el relé y, si todo salió bien, hace que el RTMP lea del relé.
-// Si algo falla, el canal queda igual que antes: el RTMP lee directo de 127.0.0.1:9999 y no hay envío secundario.
-async function prepararSalidaUdpSecundaria() {
-    if (!UDP_HLS_URL) {
-        console.log('ℹ️ [UDP] UDP_HLS_URL no está definida: no hay salida UDP secundaria (el canal sigue normal con su UDP local).');
-        return;
-    }
-    if (udpSecundarioPreparado) return;
-    udpSecundarioPreparado = true;
-    if (!validarUdpHlsUrl()) return;
-    const ok = await iniciarReleUdp();
-    if (!ok) {
-        console.log(`⛔ [UDP] No se pudo abrir el relé en 127.0.0.1:${RTMP_PUENTE_PUERTO}. La salida UDP secundaria queda desactivada; el canal sigue normal con su UDP local.`);
-        return;
-    }
-    puertoEntradaRtmp = UDP_RELE_PUERTO_RTMP; // el RTMP pasa a leer del relé (misma señal, sin recodificar)
-    udpSecundarioActivo = true;
-    console.log(`📡 [UDP] Salida UDP secundaria activada hacia ${udpDestinoHost} (-c copy, sin recodificar).`);
-}
-
-function iniciarUdpSecundario() {
-    if (!udpSecundarioActivo || !udpDestino) return;
-    if (procesoUdp) return; // ya hay uno en marcha: nunca se lanza un segundo
-    if (reintentoUdp) { clearTimeout(reintentoUdp); reintentoUdp = null; }
-    console.log(`📡 [UDP] Iniciando envío UDP secundario hacia ${udpDestinoHost} ...`);
-    let proc;
-    try {
-        proc = spawn('ffmpeg', [
-            '-hide_banner', '-nostdin',
-            '-fflags', '+nobuffer+genpts',
-            '-probesize', '500000',
-            '-analyzeduration', '500000',
-            '-i', `udp://127.0.0.1:${UDP_RELE_PUERTO_SECUNDARIO}?buffer_size=8000000&fifo_size=500000&overrun_nonfatal=1`,
-            '-c', 'copy',
-            '-flush_packets', '1',
-            '-f', 'mpegts',
-            udpDestino
-        ]);
-    } catch (e) {
-        console.log(`⛔ [UDP] No se pudo lanzar ffmpeg para el envío UDP secundario: ${e.message}. Reintento en 5s...`);
-        reintentoUdp = setTimeout(() => { reintentoUdp = null; iniciarUdpSecundario(); }, 5000);
-        return;
-    }
-    procesoUdp = proc;
-    let enviando = false;
-    let lineasMostradas = 0;
-    let ultimoEstado = 0;
-    let cerrado = false;
-    const avisoSinSenal = setTimeout(() => {
-        if (!enviando) console.log('⏳ [UDP] Pasaron 40s y no se ha enviado nada por UDP: o el codificador aún no arranca (revisa los logs de arriba) o el destino no responde.');
-    }, 40000);
-    const alCerrar = (motivo) => {
-        if (cerrado) return;
-        cerrado = true;
-        clearTimeout(avisoSinSenal);
-        if (procesoUdp === proc) procesoUdp = null;
-        console.log(`⚠️ [UDP] El envío UDP secundario se detuvo (${motivo}). Reintentando en 5s...`);
-        if (!reintentoUdp) reintentoUdp = setTimeout(() => { reintentoUdp = null; iniciarUdpSecundario(); }, 5000);
-    };
-    proc.stderr.on('data', (data) => {
-        const msg = data.toString().trim();
-        if (!msg) return;
-        if (msg.includes('frame=') || msg.includes('size=')) {
-            if (!enviando) {
-                enviando = true;
-                console.log(`✅ [UDP] Envío UDP secundario ACTIVO hacia ${udpDestinoHost}.`);
-            }
-            if (Date.now() - ultimoEstado > 60000) {
-                ultimoEstado = Date.now();
-                console.log(`📊 [UDP] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)} · paquetes en el relé: ${releUdpPaquetes}`);
-            }
-            return;
-        }
-        if (/decode_slice_header|non-existing PPS|Last message repeated|co located POCs|mmco|reference picture missing|Packet corrupt|no frame/i.test(msg)) return;
-        if (lineasMostradas < 40 || /error|failed|refused|timed out|denied|Input\/output|invalid|not found|Connection|unreachable/i.test(msg)) {
-            lineasMostradas++;
-            console.log(`[UDP] ${ocultarDestinoUdp(msg).slice(0, 300)}`);
-        }
-    });
-    proc.on('error', (err) => {
-        console.log(`⛔ [UDP] Error del proceso ffmpeg del envío UDP secundario: ${err.message}`);
-        alCerrar('error al lanzar ffmpeg');
-    });
-    proc.on('close', (code, signal) => alCerrar(`código ${code}, señal ${signal}`));
 }
 
 
@@ -943,13 +854,16 @@ function programacionDeHoy() {
     return { dia: nombresDia[dia], total: todos.length, lista };
 }
 
-// Qué lista de episodios usa cada programa (según el campo "archivo" de programacion.txt)
-function claveListaDePrograma(prog) {
-    const n = prog && prog.archivo ? prog.archivo.toLowerCase() : "";
-    if (n.includes("magazine")) return 'magazine';
-    if (n.includes("secretos") || n.includes("prosperidad")) return 'secretosProsperidad';
-    if (n.includes("cartas") || n.includes("taron")) return 'cartasTaron';
-    return datasetConfig.magazine.length > 0 ? 'magazine' : 'cartasTaron';
+// Obtiene la lista de episodios vinculada al campo "archivo" de programacion.txt.
+// Admite archivos nuevos sin tener que agregarlos manualmente al código.
+function obtenerListaDePrograma(prog) {
+    const ruta = normalizarArchivoListaPrograma(prog && prog.archivo);
+    if (ruta && Array.isArray(listasProgramasPorArchivo[ruta])) return listasProgramasPorArchivo[ruta];
+    const n = String(prog && prog.archivo || '').toLowerCase();
+    if (n.includes('magazine')) return datasetConfig.magazine;
+    if (n.includes('secretos') || n.includes('prosperidad')) return datasetConfig.secretosProsperidad;
+    if (n.includes('cartas') || n.includes('taron')) return datasetConfig.cartasTaron;
+    return datasetConfig.magazine.length > 0 ? datasetConfig.magazine : datasetConfig.cartasTaron;
 }
 
 // Decide si hay que saltar el resto de la secuencia (solo ENTRE videos, nunca a mitad de uno)
@@ -1037,14 +951,14 @@ function obtenerElementoActualEnEmision() {
 
     // Si ya no hay programa en horario (o es otro distinto), se libera la marca de "programa completado"
     if (slotCompletado) {
-        const aun = datasetConfig.programacion.some(p => p.dias.includes(diaSemana) && estaEnHorario(p.inicio, p.fin, horaStr) && `${p.nombre}|${p.inicio}` === slotCompletado);
+        const aun = datasetConfig.programacion.some(p => Array.isArray(p.dias) && p.dias.includes(diaSemana) && estaEnHorario(p.inicio, p.fin, horaStr) && `${p.nombre}|${p.inicio}` === slotCompletado);
         if (!aun) slotCompletado = "";
     }
 
     for (let i = 0; i < datasetConfig.programacion.length; i++) {
         let prog = datasetConfig.programacion[i];
         const esForzado = (programaForzado !== null && i === programaForzado);
-        if (programaForzado !== null ? esForzado : (prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr) && slotCompletado !== `${prog.nombre}|${prog.inicio}`)) {
+        if (programaForzado !== null ? esForzado : (Array.isArray(prog.dias) && prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr) && slotCompletado !== `${prog.nombre}|${prog.inicio}`)) {
             if (esForzado) { programaForzado = null; slotCompletado = ""; }
             let siguienteProg = datasetConfig.programacion[i + 1] ? datasetConfig.programacion[i + 1].nombre : "Transmisión Estelar / Gist";
             estadoActualTransmision.tituloActual = prog.nombre;
@@ -1056,7 +970,15 @@ function obtenerElementoActualEnEmision() {
             let videoClasificacion = getVideoClasificacionPorHora(horaStr);
             const anuncios = getTodaPublicidad();
 
-            let listaPrograma = datasetConfig[claveListaDePrograma(prog)];
+            let listaPrograma = obtenerListaDePrograma(prog);
+            const idProgramaLog = `${prog.nombre}|${prog.archivo || '(sin archivo)'}|${Array.isArray(listaPrograma) ? listaPrograma.length : 0}`;
+            if (ultimoProgramaInformado !== idProgramaLog) {
+                ultimoProgramaInformado = idProgramaLog;
+                console.log(`📺 [PROGRAMACIÓN] Seleccionado: "${prog.nombre}" | archivo: ${prog.archivo || 'NO DEFINIDO'} | episodios cargados: ${Array.isArray(listaPrograma) ? listaPrograma.length : 0}.`);
+            }
+            if (!Array.isArray(listaPrograma) || listaPrograma.length === 0) {
+                console.log(`⚠️ [PROGRAMACIÓN] "${prog.nombre}" está en horario, pero su lista de videos está vacía. Revisa el campo archivo en programacion.txt y que ese archivo exista en el dataset.`);
+            }
 
             let claveProg = `${prog.nombre}-${prog.inicio}`;
             if (indicesProgramas[claveProg] === undefined) {
@@ -1186,7 +1108,7 @@ function programaProgramadoAhora() {
     const { horaStr } = obtenerTiempoVenezuela();
     const diaSemana = diaSemanaVenezuela();
     for (const prog of datasetConfig.programacion) {
-        if (prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr)) {
+        if (Array.isArray(prog.dias) && prog.dias.includes(diaSemana) && estaEnHorario(prog.inicio, prog.fin, horaStr)) {
             return { prog, clave: `${prog.nombre}|${prog.inicio}` };
         }
     }
@@ -1242,10 +1164,8 @@ function forzarRecalculo() {
 
 async function motorCanalC() {
     await prepararLogo();
-    await prepararSalidaUdpSecundaria(); // opcional: solo hace algo si existe UDP_HLS_URL
     if (RTMP_URL) iniciarRTMP();
     else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
-    iniciarUdpSecundario(); // opcional: no hace nada si el envío UDP secundario no está activo
     await sincronizarDataset();
     while (true) {
         interrumpirBloque = false;
@@ -1319,6 +1239,17 @@ async function motorCanalC() {
             itemEnAire = video;
             bloqueEnAire = { tipo: itemActual.tipo || '', cola: listaElementos.map(v => v.desc), indice: i };
 
+            // Avisos de continuidad: el reloj empieza en el primer video del programa,
+            // se conserva al cambiar de episodio/video y se reinicia al entrar otro programa.
+            let segundosDesdeInicioPrograma = null;
+            if (itemActual.tipo === 'programa_secuencia' && video.permiteBanner && itemActual.claveSlot) {
+                if (estadoAvisosPrograma.clave !== itemActual.claveSlot) {
+                    estadoAvisosPrograma = { clave: itemActual.claveSlot, segundosAcumulados: 0 };
+                    console.log(`📺 [AVISOS] Contador iniciado para "${estadoActualTransmision.programaActual}". Avisos una sola vez al minuto 3.`);
+                }
+                segundosDesdeInicioPrograma = Math.max(0, estadoAvisosPrograma.segundosAcumulados);
+            }
+
             // Posición horizontal del logo (LOGO_X fijo)
             let xPos = video.logoDer ? `main_w-overlay_w-${LOGO_X}` : String(LOGO_X);
             const urlFinal = corregirUrl(video.url);
@@ -1370,69 +1301,6 @@ async function motorCanalC() {
 
             let etiqueta = 'v1';
 
-            // "ESTÁS VIENDO": aparece una sola vez por programa durante 10 segundos.
-            // Se programa a los 3 minutos del contenido; si el bloque dura menos de 3:10,
-            // aparece en sus últimos 10 segundos. No se muestra en intros, anuncios ni promos.
-            let avisoProgramaPendiente = false;
-            let avisoProgramaUmbralVideo = 0;
-            const esContenidoPrograma = itemActual.tipo === 'programa_secuencia'
-                && video.logo
-                && /\(Parte [12] -/.test(String(video.desc || '')); // solo las partes reales del programa
-
-            if (esContenidoPrograma) {
-                const claveAviso = `${new Date().toLocaleDateString('en-CA', { timeZone: 'America/Caracas' })}|${itemActual.claveSlot || itemActual.programaActual || video.desc}`;
-                if (!inicioContenidoPrograma.has(claveAviso)) {
-                    inicioContenidoPrograma.set(claveAviso, Date.now());
-                }
-
-                const parseMinutos = (hora) => {
-                    const m = String(hora || '').match(/^(\\d{1,2}):(\\d{2})/);
-                    return m ? Number(m[1]) * 60 + Number(m[2]) : NaN;
-                };
-                const inicioMin = parseMinutos(itemActual.horaInicioBloque);
-                const finMin = parseMinutos(itemActual.horaFinBloque);
-                let duracionBloque = (Number.isFinite(inicioMin) && Number.isFinite(finMin))
-                    ? (finMin - inicioMin) * 60 : 0;
-                if (duracionBloque < 0) duracionBloque += 24 * 60 * 60;
-
-                const umbralAviso = duracionBloque > 0 && duracionBloque < 190
-                    ? Math.max(0, duracionBloque - 10)
-                    : 180;
-                const transcurrido = Math.max(0, (Date.now() - inicioContenidoPrograma.get(claveAviso)) / 1000);
-
-                if (!avisosProgramaMostrados.has(claveAviso)) {
-                    const demora = Math.max(0, umbralAviso - transcurrido);
-                    const fuenteEtiqueta = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                    // Los dos avisos salen juntos durante los mismos 10 segundos:
-                    // programa actual arriba y próximo programa debajo.
-                    const escaparTextoDrawtext = (valor) => String(valor || '')
-                        .replace(/\\/g, '\\\\')
-                        .replace(/:/g, '\\:')
-                        .replace(/'/g, "\\'")
-                        .replace(/%/g, '\\%');
-                    const programaActualAviso = escaparTextoDrawtext(
-                        estadoActualTransmision.programaActual || estadoActualTransmision.tituloActual || 'Programa actual'
-                    );
-                    const proximoProgramaAviso = escaparTextoDrawtext(
-                        estadoActualTransmision.aContinuacion || 'Programación en espera'
-                    );
-                    const habilitarAviso = `enable='between(t,${demora.toFixed(2)},${(demora + 10).toFixed(2)})'`;
-                    filterComplex += `[${etiqueta}]drawtext=${fuenteEtiqueta}text='ESTÁS VIENDO: ${programaActualAviso}':x=w-tw-70:y=70:fontsize=38:fontcolor=white:shadowcolor=black@0.45:shadowx=1:shadowy=1:${habilitarAviso}[av1];`;
-                    filterComplex += `[av1]drawtext=${fuenteEtiqueta}text='A CONTINUACIÓN: ${proximoProgramaAviso}':x=w-tw-70:y=118:fontsize=34:fontcolor=white:shadowcolor=black@0.45:shadowx=1:shadowy=1:${habilitarAviso}[ve];`;
-                    etiqueta = 've';
-
-                    if (demora <= 0) {
-                        // Ya pasaron los 3 minutos: este archivo inicia el aviso ahora.
-                        avisosProgramaMostrados.add(claveAviso);
-                    } else {
-                        // Si este archivo termina antes del momento previsto, el siguiente
-                        // video del mismo programa volverá a calcular cuánto falta.
-                        avisoProgramaPendiente = true;
-                        avisoProgramaUmbralVideo = demora;
-                    }
-                }
-            }
-
             // Barra de noticias (azul, abajo): sube deslizando y el texto corre de derecha a izquierda.
             // Va DEBAJO del banner del evento (el banner queda encima y no se mueve).
             const ajN = datasetConfig.ajustes || AJUSTES_DEFECTO;
@@ -1478,6 +1346,31 @@ async function motorCanalC() {
                 // Texto de la cuenta regresiva movido un poco más hacia la derecha (xCard + 50)
                 filterComplex += `[${etiqueta}]drawtext=${fuente}textfile=${ARCHIVO_CUENTA}:reload=1:expansion=none:x=${desliza(xCard + 50)}:y=main_h-175:fontsize=42:fontcolor=white:box=1:boxcolor=black@0.0:boxborderw=19[vt];`;
                 etiqueta = 'vt';
+            }
+
+            // Avisos de continuidad arriba a la derecha:
+            // minuto 3-3:05 "ESTÁS VIENDO", 3:05-3:10 "A CONTINUACIÓN".
+            // El tiempo se calcula por programa completo, no se reinicia entre videos.
+            if (segundosDesdeInicioPrograma !== null) {
+                const actualHasta = 185 - segundosDesdeInicioPrograma;
+                const siguienteHasta = 190 - segundosDesdeInicioPrograma;
+                const fuenteAviso = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
+                const nombreActual = String(estadoActualTransmision.programaActual || 'Canal C').replace(/[\\r\\n]+/g, ' ').trim();
+                const nombreSiguiente = String(estadoActualTransmision.aContinuacion || 'Próximamente').replace(/[\\r\\n]+/g, ' ').trim();
+
+                if (actualHasta > 0) {
+                    const actualDesde = Math.max(0, 180 - segundosDesdeInicioPrograma);
+                    fs.writeFileSync(ARCHIVO_AVISO_ACTUAL, `ESTÁS VIENDO: ${nombreActual}`, 'utf8');
+                    filterComplex += `[${etiqueta}]drawtext=${fuenteAviso}textfile=${ARCHIVO_AVISO_ACTUAL}:expansion=none:enable='between(t,${actualDesde.toFixed(3)},${actualHasta.toFixed(3)})':x='w-tw-35':y=35:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=12[vav];`;
+                    etiqueta = 'vav';
+                }
+
+                if (siguienteHasta > 0) {
+                    const siguienteDesde = Math.max(0, 185 - segundosDesdeInicioPrograma);
+                    fs.writeFileSync(ARCHIVO_AVISO_SIGUIENTE, `A CONTINUACIÓN: ${nombreSiguiente}`, 'utf8');
+                    filterComplex += `[${etiqueta}]drawtext=${fuenteAviso}textfile=${ARCHIVO_AVISO_SIGUIENTE}:expansion=none:enable='between(t,${siguienteDesde.toFixed(3)},${siguienteHasta.toFixed(3)})':x='w-tw-35':y=35:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=12[vac];`;
+                    etiqueta = 'vac';
+                }
             }
 
             filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
@@ -1591,10 +1484,6 @@ async function motorCanalC() {
                 }, 5000);
 
                 ffmpegProc.on('close', (code) => {
-                    if (avisoProgramaPendiente && tiempoActual >= avisoProgramaUmbralVideo) {
-                        const claveAviso = `${new Date().toLocaleDateString('en-CA', { timeZone: 'America/Caracas' })}|${itemActual.claveSlot || itemActual.programaActual || video.desc}`;
-                        avisosProgramaMostrados.add(claveAviso);
-                    }
                     console.log(`ℹ️ [CIERRE] Finalizó el archivo: ${video.desc} (Código: ${code})`);
                     if (code !== 0 && code !== null) {
                         console.log(`❌ [FFMPEG] Error al emitir "${video.desc}". Últimas líneas de ffmpeg:\n   ` + ultimasLineasFfmpeg.join('\n   '));
@@ -1604,10 +1493,24 @@ async function motorCanalC() {
                     if (procesoActual === ffmpegProc) procesoActual = null;
                     // Si se reinicia el video a mano, no cuenta como terminado (no avanza el episodio)
                     // Si se reinició a mano o se cortó por horario, el episodio no cuenta como emitido
+                    if (itemActual.tipo === 'programa_secuencia' && video.permiteBanner &&
+                        estadoAvisosPrograma.clave === itemActual.claveSlot && tiempoActual > 0) {
+                        estadoAvisosPrograma.segundosAcumulados += tiempoActual;
+                    }
                     if (!reinicioSolicitado && !cortePorHorario && typeof video.alTerminar === 'function') video.alTerminar();
                     resolve();
                 });
             });
+
+            // Si Hugging Face cambió la parrilla mientras se emitía un video,
+            // recalcula el bloque al terminar este archivo; no espera a consumir toda la secuencia antigua.
+            if (!reinicioSolicitado && itemActual.tipo === 'programa_secuencia' && !itemActual.forzado) {
+                const programadoAhora = programaProgramadoAhora();
+                if (programadoAhora && programadoAhora.clave !== itemActual.claveSlot) {
+                    console.log(`🔁 [PROGRAMACIÓN] Cambio detectado al terminar el video. Sale "${itemActual.claveSlot}" y entra "${programadoAhora.prog.nombre}".`);
+                    break;
+                }
+            }
 
             if (reinicioSolicitado) {
                 reinicioSolicitado = false;
