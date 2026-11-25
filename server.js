@@ -23,13 +23,13 @@ const DATASET_REPO_ID = process.env.DATASET_REPO_ID || "cristianbracho904/progra
 const DATASET_BRANCH = process.env.DATASET_BRANCH || "main";
 const HF_TOKEN = process.env.HF_TOKEN || "";
 // Salida RTMP/RTMPS (opcional). La URL completa y sus claves van SOLO en variables de entorno.
-// Puedes usar RTMP_URL="rtmp://..." o RTMPS_URL="rtmps://...".
-// También se acepta rtmps:// dentro de RTMP_URL para mantener compatibilidad.
+// Para RTMP usa RTMP_URL=rtmp://...; para RTMPS usa RTMPS_URL=rtmps://...
+// También se acepta rtmps:// dentro de RTMP_URL. Si ambas existen, RTMPS_URL tiene prioridad.
 const RTMP_URL_CONFIG = (process.env.RTMP_URL || "").trim();
 const RTMPS_URL_CONFIG = (process.env.RTMPS_URL || "").trim();
 const RTMP_URL = RTMPS_URL_CONFIG || RTMP_URL_CONFIG;
 const PROTOCOLO_SALIDA = /^rtmps:\/\//i.test(RTMP_URL) ? 'RTMPS' : 'RTMP';
-// El canal sale SOLO por RTMP (ya no se crean archivos HLS). El codificador manda la señal al puerto local 9999 y de ahí la toma el proceso RTMP.
+// El codificador manda la señal al puerto local 9999 y las salidas la toman sin recodificar.
 const RTMP_PUENTE_PUERTO = 9999;
 
 const GIST_FALLBACK_URL = "https://gist.githubusercontent.com/crcistianbracho10/6e4a07d268460ea807abf28f77c3880e/raw";
@@ -566,7 +566,6 @@ function iniciarRTMP() {
         }
     });
 }
-
 
 // ---------------------------------------------------------------
 // Logo del canal: se busca en varias carpetas (sin importar mayúsculas) y, si no está, se puede bajar de LOGO_URL
@@ -1168,8 +1167,15 @@ function forzarRecalculo() {
 
 async function motorCanalC() {
     await prepararLogo();
-    if (RTMP_URL) iniciarRTMP();
-    else console.log('⚠️ [RTMP/RTMPS] Falta RTMP_URL o RTMPS_URL: el canal no tiene ninguna salida. Configura una de ellas y reinicia.');
+    if (RTMP_URL) {
+        if (!/^rtmps?:\/\//i.test(RTMP_URL)) {
+            console.log('❌ La URL de salida debe comenzar con rtmp:// o rtmps://. Revisa RTMP_URL o RTMPS_URL.');
+        } else {
+            iniciarRTMP();
+        }
+    } else {
+        console.log('⚠️ No hay salida configurada. Define RTMP_URL (rtmp://...) o RTMPS_URL (rtmps://...) y reinicia.');
+    }
     await sincronizarDataset();
     while (true) {
         interrumpirBloque = false;
