@@ -22,13 +22,9 @@ const port = process.env.PORT || 8080; // blitz.cloud lee el puerto declarado en
 const DATASET_REPO_ID = process.env.DATASET_REPO_ID || "cristianbracho904/programacion-tv";
 const DATASET_BRANCH = process.env.DATASET_BRANCH || "main";
 const HF_TOKEN = process.env.HF_TOKEN || "";
-// Salida RTMP/RTMPS (opcional). La URL completa y sus claves van SOLO en variables de entorno.
-// Puedes usar RTMP_URL="rtmp://..." o RTMPS_URL="rtmps://...".
-// También se acepta rtmps:// dentro de RTMP_URL para mantener compatibilidad.
-const RTMP_URL_CONFIG = (process.env.RTMP_URL || "").trim();
-const RTMPS_URL_CONFIG = (process.env.RTMPS_URL || "").trim();
-const RTMP_URL = RTMPS_URL_CONFIG || RTMP_URL_CONFIG;
-const PROTOCOLO_SALIDA = /^rtmps:\/\//i.test(RTMP_URL) ? 'RTMPS' : 'RTMP';
+// Salida RTMP (opcional): URL completa de ingesta, con la clave y los tokens. NUNCA va en el código (la imagen es pública),
+// solo en las variables de entorno. Ejemplo: rtmp://live.opencaster.com/opencaster/NOMBRE?psk=...&tk=...
+const RTMP_URL = (process.env.RTMP_URL || "").trim();
 // El canal sale SOLO por RTMP (ya no se crean archivos HLS). El codificador manda la señal al puerto local 9999 y de ahí la toma el proceso RTMP.
 const RTMP_PUENTE_PUERTO = 9999;
 
@@ -494,7 +490,7 @@ setTimeout(() => sincronizarDataset(), 1000);
 setInterval(() => sincronizarDataset(), 40000);
 
 // ---------------------------------------------------------------
-// Salida RTMP/RTMPS: manda la misma señal del canal a un servidor externo (sin recodificar)
+// Salida RTMP: manda la misma señal del canal a un servidor externo (sin recodificar)
 // ---------------------------------------------------------------
 let procesoRtmp = null;
 let reintentoRtmp = null;
@@ -512,7 +508,7 @@ function iniciarRTMP() {
     }
     let hostRtmp = '';
     try { hostRtmp = new URL(RTMP_URL).host; } catch (e) { hostRtmp = '(RTMP_URL no es una URL válida)'; }
-    console.log(`📡 [${PROTOCOLO_SALIDA}] Conectando salida ${PROTOCOLO_SALIDA} a ${hostRtmp} ...`);
+    console.log(`📡 [RTMP] Conectando salida RTMP a ${hostRtmp} ...`);
     const proc = spawn('ffmpeg', [
         '-fflags', '+nobuffer+genpts',
         '-probesize', '500000',
@@ -531,7 +527,7 @@ function iniciarRTMP() {
     let lineasMostradas = 0;
     let ultimoEstado = 0;
     const avisoSinSenal = setTimeout(() => {
-        if (!conectado) console.log(`⏳ [${PROTOCOLO_SALIDA}] Pasaron 40s y no llegan datos de video: revisa el codificador o la conexión ${PROTOCOLO_SALIDA}.`);
+        if (!conectado) console.log('⏳ [RTMP] Pasaron 40s y no llegan datos de video al RTMP: o el codificador aún no arranca (revisa los logs de arriba) o el servidor RTMP no respondió.');
     }, 40000);
     proc.stderr.on('data', (data) => {
         const msg = data.toString().trim();
@@ -540,11 +536,11 @@ function iniciarRTMP() {
         if (msg.includes('frame=')) {
             if (!conectado) {
                 conectado = true;
-                console.log(`✅ [${PROTOCOLO_SALIDA}] Transmitiendo al servidor ${PROTOCOLO_SALIDA}.`);
+                console.log('✅ [RTMP] Transmitiendo al servidor RTMP.');
             }
             if (Date.now() - ultimoEstado > 60000) {
                 ultimoEstado = Date.now();
-                console.log(`📊 [${PROTOCOLO_SALIDA}] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)}`);
+                console.log(`📊 [RTMP] ${msg.split('\n').pop().replace(/\s+/g, ' ').slice(0, 160)}`);
             }
             return;
         }
@@ -552,16 +548,16 @@ function iniciarRTMP() {
         // Muestra lo primero que dice ffmpeg (entrada, salida, errores) para poder diagnosticar; la clave se oculta.
         if (lineasMostradas < 40 || /error|failed|refused|timed out|denied|unauthorized|Input\/output|invalid|not found|Connection/i.test(msg)) {
             lineasMostradas++;
-            console.log(`[${PROTOCOLO_SALIDA}] ${ocultarClaveRtmp(msg).slice(0, 300)}`);
+            console.log(`[RTMP] ${ocultarClaveRtmp(msg).slice(0, 300)}`);
         }
     });
     proc.on('close', (code, signal) => {
         clearTimeout(avisoSinSenal);
         if (yaPublicando) {
-            console.log(`⛔ [${PROTOCOLO_SALIDA}] El servidor indica que esta clave ya está publicando desde otra sesión. Cierra la otra emisión o espera a que expire. Reintento en 20s.`);
+            console.log('⛔ [RTMP] Opencaster dice "Already publishing": ya hay OTRA transmisión usando esta misma clave (otra copia de esta app, un despliegue anterior que sigue encendido, u otro programa/OBS). Apaga la otra o espera a que su sesión expire. Reintento en 20s.');
             reintentoRtmp = setTimeout(iniciarRTMP, 20000);
         } else {
-            console.log(`⚠️ [${PROTOCOLO_SALIDA}] La salida ${PROTOCOLO_SALIDA} se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
+            console.log(`⚠️ [RTMP] La salida RTMP se cerró (código ${code}, señal ${signal}). Reintentando en 5s...`);
             reintentoRtmp = setTimeout(iniciarRTMP, 5000);
         }
     });
@@ -1169,7 +1165,7 @@ function forzarRecalculo() {
 async function motorCanalC() {
     await prepararLogo();
     if (RTMP_URL) iniciarRTMP();
-    else console.log('⚠️ [RTMP/RTMPS] Falta RTMP_URL o RTMPS_URL: el canal no tiene ninguna salida. Configura una de ellas y reinicia.');
+    else console.log('⚠️ [RTMP] Falta la variable de entorno RTMP_URL: el canal no tiene ninguna salida. Defínela y reinicia.');
     await sincronizarDataset();
     while (true) {
         interrumpirBloque = false;
@@ -1352,25 +1348,29 @@ async function motorCanalC() {
                 etiqueta = 'vt';
             }
 
-            // Continuidad: etiqueta arriba y nombre del programa debajo, alineados a la derecha.
-            // En cada aviso el bloque sale completamente por la izquierda y vuelve a entrar.
+            // Avisos de continuidad arriba a la derecha:
+            // minuto 3-3:05 "ESTÁS VIENDO", 3:05-3:10 "A CONTINUACIÓN".
+            // El tiempo se calcula por programa completo, no se reinicia entre videos.
             if (segundosDesdeInicioPrograma !== null) {
+                const actualHasta = 185 - segundosDesdeInicioPrograma;
+                const siguienteHasta = 190 - segundosDesdeInicioPrograma;
                 const fuenteAviso = FONT_FILE ? `fontfile=${FONT_FILE}:` : '';
-                const nombreActual = String(estadoActualTransmision.programaActual || 'Canal C').replace(/[\r\n]+/g, ' ').trim();
-                const nombreSiguiente = String(estadoActualTransmision.aContinuacion || 'Próximamente').replace(/[\r\n]+/g, ' ').trim();
-                const crearAviso = (inicio, etiquetaTexto, nombre, prefijo) => {
-                    const fin = inicio + 5;
-                    const archivoEtiqueta = `/tmp/aviso_${prefijo}_etiqueta.txt`;
-                    const archivoNombre = `/tmp/aviso_${prefijo}_nombre.txt`;
-                    fs.writeFileSync(archivoEtiqueta, etiquetaTexto, 'utf8');
-                    fs.writeFileSync(archivoNombre, nombre, 'utf8');
-                    const mover = `if(lt(t-${inicio},2.5),w-tw-35-((t-${inicio})/2.5)*(w+tw+40),-tw-40+((t-${inicio}-2.5)/2.5)*(w+tw+5))`;
-                    filterComplex += `[${etiqueta}]drawtext=${fuenteAviso}textfile=${archivoEtiqueta}:expansion=none:enable='between(t,${inicio.toFixed(3)},${fin.toFixed(3)})':x='${mover}':y=28:fontsize=25:fontcolor=white:box=1:boxcolor=black@0.78:boxborderw=9[v${prefijo}a];`;
-                    filterComplex += `[v${prefijo}a]drawtext=${fuenteAviso}textfile=${archivoNombre}:expansion=none:enable='between(t,${inicio.toFixed(3)},${fin.toFixed(3)})':x='${mover}':y=63:fontsize=34:fontcolor=white:borderw=1:bordercolor=black@0.8:box=1:boxcolor=black@0.78:boxborderw=10[v${prefijo}b];`;
-                    etiqueta = `v${prefijo}b`;
-                };
-                if (segundosDesdeInicioPrograma < 185) crearAviso(Math.max(0, 180 - segundosDesdeInicioPrograma), 'ESTÁS VIENDO', nombreActual, 'actual');
-                if (segundosDesdeInicioPrograma < 190) crearAviso(Math.max(0, 185 - segundosDesdeInicioPrograma), 'A CONTINUACIÓN', nombreSiguiente, 'siguiente');
+                const nombreActual = String(estadoActualTransmision.programaActual || 'Canal C').replace(/[\\r\\n]+/g, ' ').trim();
+                const nombreSiguiente = String(estadoActualTransmision.aContinuacion || 'Próximamente').replace(/[\\r\\n]+/g, ' ').trim();
+
+                if (actualHasta > 0) {
+                    const actualDesde = Math.max(0, 180 - segundosDesdeInicioPrograma);
+                    fs.writeFileSync(ARCHIVO_AVISO_ACTUAL, `ESTÁS VIENDO: ${nombreActual}`, 'utf8');
+                    filterComplex += `[${etiqueta}]drawtext=${fuenteAviso}textfile=${ARCHIVO_AVISO_ACTUAL}:expansion=none:enable='between(t,${actualDesde.toFixed(3)},${actualHasta.toFixed(3)})':x='w-tw-35':y=35:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=12[vav];`;
+                    etiqueta = 'vav';
+                }
+
+                if (siguienteHasta > 0) {
+                    const siguienteDesde = Math.max(0, 185 - segundosDesdeInicioPrograma);
+                    fs.writeFileSync(ARCHIVO_AVISO_SIGUIENTE, `A CONTINUACIÓN: ${nombreSiguiente}`, 'utf8');
+                    filterComplex += `[${etiqueta}]drawtext=${fuenteAviso}textfile=${ARCHIVO_AVISO_SIGUIENTE}:expansion=none:enable='between(t,${siguienteDesde.toFixed(3)},${siguienteHasta.toFixed(3)})':x='w-tw-35':y=35:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=12[vac];`;
+                    etiqueta = 'vac';
+                }
             }
 
             filterComplex += `[${etiqueta}]scale=${sel.w}:${sel.h}:flags=fast_bilinear,format=yuv420p[v];[0:a]aresample=async=1000:first_pts=0,aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a]`;
